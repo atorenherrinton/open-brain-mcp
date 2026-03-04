@@ -1,0 +1,25 @@
+{
+  "name": "open-brain-local",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "start:mcp": "node mcp-server.js",
+    "docker:up": "docker compose up -d --build postgres api",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f api postgres",
+    "docker:mcp": "docker compose run --rm -i mcp"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "pg": "^8.19.0",
+    "pgvector": "^0.2.1"
+  }
+}
