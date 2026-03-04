@@ -17,6 +17,7 @@ if (fs.existsSync(envPath)) {
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const MAX_THOUGHT_CHARS = 12000;
 
 const pool = new Pool({ connectionString: DATABASE_URL });
 
@@ -246,14 +247,30 @@ async function handleThoughtStats() {
 }
 
 async function handleCaptureThought({ content }) {
+  const normalizedContent = String(content ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\t ]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  if (!normalizedContent) {
+    throw new Error("Thought content cannot be empty.");
+  }
+
+  if (normalizedContent.length > MAX_THOUGHT_CHARS) {
+    throw new Error(
+      `Thought is too long (${normalizedContent.length} chars). Max allowed is ${MAX_THOUGHT_CHARS}.`
+    );
+  }
+
   const [embedding, metadata] = await Promise.all([
-    getEmbedding(content),
-    extractMetadata(content),
+    getEmbedding(normalizedContent),
+    extractMetadata(normalizedContent),
   ]);
 
   await pool.query(
     `INSERT INTO thoughts (content, embedding, metadata) VALUES ($1, $2, $3)`,
-    [content, pgvector.toSql(embedding), { ...metadata, source: "mcp" }]
+    [normalizedContent, pgvector.toSql(embedding), { ...metadata, source: "mcp" }]
   );
 
   let confirmation = `Captured as ${metadata.type || "thought"}`;
