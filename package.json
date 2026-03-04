@@ -7,10 +7,12 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js",
     "start:mcp": "node mcp-server.js",
+    "test:mcp-init": "node scripts/mcp-init-smoke.js",
+    "test:mcp-init-line": "node scripts/mcp-init-line-smoke.js",
     "docker:up": "docker compose up -d --build postgres api",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f api postgres",
-    "docker:mcp": "docker compose run --rm -i mcp"
+    "docker:mcp": "docker compose run --rm -i --build mcp"
   },
   "keywords": [],
   "author": "",
