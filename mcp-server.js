@@ -252,7 +252,8 @@ async function handleCaptureThought({ content }) {
     .replace(/^[\t ]+/gm, "")
     .replace(/[\t ]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .trim()
+    .replace(/\s+/g, " ");
 
   if (!normalizedContent) {
     throw new Error("Thought content cannot be empty.");

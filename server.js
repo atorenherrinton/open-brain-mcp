@@ -103,7 +103,8 @@ app.post("/capture", requireKey, async (req, res) => {
       .replace(/^[\t ]+/gm, "")
       .replace(/[\t ]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
-      .trim();
+      .trim()
+      .replace(/\s+/g, " ");
 
     if (!normalizedContent) {
       return res.status(400).json({ error: "Content is required" });
