@@ -1,10 +1,23 @@
-require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
 const { Pool } = require("pg");
 const pgvector = require("pgvector");
+
+const envPath = path.resolve(__dirname, ".env");
+if (fs.existsSync(envPath)) {
+  const parsed = dotenv.parse(fs.readFileSync(envPath));
+  for (const [key, value] of Object.entries(parsed)) {
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const MAX_THOUGHT_CHARS = 12000;
 
 const pool = new Pool({ connectionString: DATABASE_URL });
 
@@ -58,17 +71,18 @@ Only extract what's explicitly there.`,
 
 // ─── MCP Protocol over stdio ─────────────────────────────
 
-const readline = require("readline");
-
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: false,
-});
+let transportMode = "unknown"; // "framed" | "line" | "unknown"
 
 function send(msg) {
-  const json = JSON.stringify(msg);
-  process.stdout.write(`Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`);
+  const payload = JSON.stringify(msg);
+
+  if (transportMode === "line") {
+    process.stdout.write(payload + "\n");
+    return;
+  }
+
+  const header = `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n`;
+  process.stdout.write(header + payload);
 }
 
 const TOOLS = [
@@ -251,13 +265,13 @@ async function handleCaptureThought({ content }) {
   }
 
   const [embedding, metadata] = await Promise.all([
-    getEmbedding(content),
-    extractMetadata(content),
+    getEmbedding(normalizedContent),
+    extractMetadata(normalizedContent),
   ]);
 
   await pool.query(
     `INSERT INTO thoughts (content, embedding, metadata) VALUES ($1, $2, $3)`,
-    [content, pgvector.toSql(embedding), { ...metadata, source: "mcp" }]
+    [normalizedContent, pgvector.toSql(embedding), { ...metadata, source: "mcp" }]
   );
 
   let confirmation = `Captured as ${metadata.type || "thought"}`;
@@ -270,37 +284,78 @@ async function handleCaptureThought({ content }) {
 
 // ─── MCP Message Handling ─────────────────────────────────
 
-let buffer = "";
+let inputBuffer = Buffer.alloc(0);
 
 process.stdin.on("data", (chunk) => {
-  buffer += chunk.toString();
+  inputBuffer = Buffer.concat([inputBuffer, chunk]);
   processBuffer();
 });
 
-function processBuffer() {
-  while (true) {
-    const headerEnd = buffer.indexOf("\r\n\r\n");
-    if (headerEnd === -1) return;
+function processRawMessage(raw, source = "unknown") {
+  const trimmed = raw.trim();
+  if (!trimmed) return;
 
-    const header = buffer.slice(0, headerEnd);
-    const match = header.match(/Content-Length:\s*(\d+)/i);
-    if (!match) {
-      buffer = buffer.slice(headerEnd + 4);
+  if (transportMode === "unknown") {
+    if (source === "line") transportMode = "line";
+    if (source === "framed") transportMode = "framed";
+  }
+
+  try {
+    handleMessage(JSON.parse(trimmed));
+  } catch (e) {
+    console.error("Parse error:", e);
+  }
+}
+
+function processBuffer() {
+  while (inputBuffer.length > 0) {
+    const headerEndCrlf = inputBuffer.indexOf("\r\n\r\n");
+    const headerEndLf = inputBuffer.indexOf("\n\n");
+
+    let headerEnd = -1;
+    let delimiterLength = 0;
+
+    if (headerEndCrlf !== -1 && (headerEndLf === -1 || headerEndCrlf < headerEndLf)) {
+      headerEnd = headerEndCrlf;
+      delimiterLength = 4;
+    } else if (headerEndLf !== -1) {
+      headerEnd = headerEndLf;
+      delimiterLength = 2;
+    }
+
+    if (headerEnd === -1) {
+      const newline = inputBuffer.indexOf("\n");
+      if (newline === -1) break;
+
+      const line = inputBuffer.slice(0, newline).toString("utf8");
+      inputBuffer = inputBuffer.slice(newline + 1);
+      processRawMessage(line, "line");
       continue;
     }
 
-    const len = parseInt(match[1]);
-    const bodyStart = headerEnd + 4;
-    if (buffer.length < bodyStart + len) return;
+    const headerText = inputBuffer.slice(0, headerEnd).toString("utf8");
+    const match = headerText.match(/content-length\s*:\s*(\d+)/i);
 
-    const body = buffer.slice(bodyStart, bodyStart + len);
-    buffer = buffer.slice(bodyStart + len);
-
-    try {
-      handleMessage(JSON.parse(body));
-    } catch (e) {
-      console.error("Parse error:", e);
+    if (!match) {
+      const maybeJson = inputBuffer.slice(0, headerEnd).toString("utf8");
+      inputBuffer = inputBuffer.slice(headerEnd + delimiterLength);
+      processRawMessage(maybeJson, "line");
+      continue;
     }
+
+    if (transportMode === "unknown") {
+      transportMode = "framed";
+    }
+
+    const contentLength = parseInt(match[1], 10);
+    const messageStart = headerEnd + delimiterLength;
+    const messageEnd = messageStart + contentLength;
+
+    if (inputBuffer.length < messageEnd) break;
+
+    const payload = inputBuffer.slice(messageStart, messageEnd).toString("utf8");
+    inputBuffer = inputBuffer.slice(messageEnd);
+    processRawMessage(payload, "framed");
   }
 }
 

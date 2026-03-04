@@ -48,7 +48,7 @@ npm run docker:mcp
 Equivalent direct command:
 
 ```bash
-docker compose run --rm -i mcp
+docker compose run --rm -i --build mcp
 ```
 
 ## Notes
@@ -56,5 +56,5 @@ docker compose run --rm -i mcp
 - Postgres data persists in the `pgdata` Docker volume.
 - The schema auto-initializes from `schema.sql` on first DB startup.
 - API runs on `http://localhost:3333`.
-- Postgres is only exposed to other Docker services by default (no host port mapping).
+- Postgres is exposed on `localhost:5434` for host tools like DataGrip.
 - In Docker, DB host is `postgres` (already wired in compose `DATABASE_URL`).
