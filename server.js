@@ -97,7 +97,14 @@ app.get("/health", async (req, res) => {
 app.post("/capture", requireKey, async (req, res) => {
   try {
     const { content, source } = req.body;
-    if (!content || !content.trim()) {
+    const normalizedContent = String(content ?? "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/^[\t ]+/gm, "")
+      .replace(/[\t ]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    if (!normalizedContent) {
       return res.status(400).json({ error: "Content is required" });
     }
 

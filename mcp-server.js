@@ -233,6 +233,23 @@ async function handleThoughtStats() {
 }
 
 async function handleCaptureThought({ content }) {
+  const normalizedContent = String(content ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/^[\t ]+/gm, "")
+    .replace(/[\t ]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  if (!normalizedContent) {
+    throw new Error("Thought content cannot be empty.");
+  }
+
+  if (normalizedContent.length > MAX_THOUGHT_CHARS) {
+    throw new Error(
+      `Thought is too long (${normalizedContent.length} chars). Max allowed is ${MAX_THOUGHT_CHARS}.`
+    );
+  }
+
   const [embedding, metadata] = await Promise.all([
     getEmbedding(content),
     extractMetadata(content),
