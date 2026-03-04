@@ -9,6 +9,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const MCP_ACCESS_KEY = process.env.MCP_ACCESS_KEY;
 const PORT = parseInt(process.env.SERVER_PORT || "3333", 10);
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const MAX_THOUGHT_CHARS = 12000;
 
 const pool = new Pool({ connectionString: DATABASE_URL });
 
@@ -97,20 +98,32 @@ app.get("/health", async (req, res) => {
 app.post("/capture", requireKey, async (req, res) => {
   try {
     const { content, source } = req.body;
-    if (!content || !content.trim()) {
+    const normalizedContent = String(content ?? "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\t ]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    if (!normalizedContent) {
       return res.status(400).json({ error: "Content is required" });
     }
 
+    if (normalizedContent.length > MAX_THOUGHT_CHARS) {
+      return res.status(400).json({
+        error: `Content is too long (${normalizedContent.length} chars). Max allowed is ${MAX_THOUGHT_CHARS}.`,
+      });
+    }
+
     const [embedding, metadata] = await Promise.all([
-      getEmbedding(content),
-      extractMetadata(content),
+      getEmbedding(normalizedContent),
+      extractMetadata(normalizedContent),
     ]);
 
     const result = await pool.query(
       `INSERT INTO thoughts (content, embedding, metadata)
        VALUES ($1, $2, $3)
        RETURNING id, created_at`,
-      [content, pgvector.toSql(embedding), { ...metadata, source: source || "api" }]
+      [normalizedContent, pgvector.toSql(embedding), { ...metadata, source: source || "api" }]
     );
 
     const meta = metadata;
