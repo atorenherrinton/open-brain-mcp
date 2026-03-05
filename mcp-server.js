@@ -416,12 +416,12 @@ async function handleFindAncestors({ name, given_name, surname, birth_date, birt
   if (given_name) { conditions.push(`given_name ILIKE $${idx++}`); params.push(`%${given_name}%`); }
   if (surname) { conditions.push(`surname ILIKE $${idx++}`); params.push(`%${surname}%`); }
   if (birth_date) { conditions.push(`birth_date ILIKE $${idx++}`); params.push(`%${birth_date}%`); }
-  if (birth_year_from) { conditions.push(`CAST(substring(birth_date FROM '\d{4}') AS INTEGER) >= $${idx++}`); params.push(birth_year_from); }
-  if (birth_year_to) { conditions.push(`CAST(substring(birth_date FROM '\d{4}') AS INTEGER) <= $${idx++}`); params.push(birth_year_to); }
+  if (birth_year_from) { conditions.push(`CAST(substring(birth_date FROM '[0-9]{4}') AS INTEGER) >= $${idx++}`); params.push(birth_year_from); }
+  if (birth_year_to) { conditions.push(`CAST(substring(birth_date FROM '[0-9]{4}') AS INTEGER) <= $${idx++}`); params.push(birth_year_to); }
   if (birth_place) { conditions.push(`birth_place ILIKE $${idx++}`); params.push(`%${birth_place}%`); }
   if (death_date) { conditions.push(`death_date ILIKE $${idx++}`); params.push(`%${death_date}%`); }
-  if (death_year_from) { conditions.push(`CAST(substring(death_date FROM '\d{4}') AS INTEGER) >= $${idx++}`); params.push(death_year_from); }
-  if (death_year_to) { conditions.push(`CAST(substring(death_date FROM '\d{4}') AS INTEGER) <= $${idx++}`); params.push(death_year_to); }
+  if (death_year_from) { conditions.push(`CAST(substring(death_date FROM '[0-9]{4}') AS INTEGER) >= $${idx++}`); params.push(death_year_from); }
+  if (death_year_to) { conditions.push(`CAST(substring(death_date FROM '[0-9]{4}') AS INTEGER) <= $${idx++}`); params.push(death_year_to); }
   if (death_place) { conditions.push(`death_place ILIKE $${idx++}`); params.push(`%${death_place}%`); }
   if (burial_place) { conditions.push(`burial_place ILIKE $${idx++}`); params.push(`%${burial_place}%`); }
   if (sex) { conditions.push(`sex = $${idx++}`); params.push(sex.charAt(0).toUpperCase()); }
