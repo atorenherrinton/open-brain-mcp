@@ -1,5 +1,5 @@
 {
-  "name": "open-brain-local",
+  "name": "open-brain-mcp",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -8,7 +8,6 @@
     "start": "node server.js",
     "start:mcp": "node mcp-server.js",
     "import:ged": "node scripts/import-ged-by-person.js",
-    "import:ancestors": "node scripts/import-ged-ancestors.js",
     "test:mcp-init": "node scripts/mcp-init-smoke.js",
     "test:mcp-init-line": "node scripts/mcp-init-line-smoke.js",
     "docker:up": "docker compose up -d --build postgres api",

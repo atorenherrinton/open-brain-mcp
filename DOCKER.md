@@ -5,7 +5,7 @@
 Copy your env file and set your real key values:
 
 ```bash
-cd ~/open-brain-local
+cd ~/open-brain-mcp
 cp .env.docker.example .env
 ```
 

@@ -209,7 +209,7 @@ psql open_brain -c "\df match_thoughts"
 ### Step 4: Create the Project
 
 ```bash
-mkdir -p ~/open-brain-local && cd ~/open-brain-local
+mkdir -p ~/open-brain-mcp && cd ~/open-brain-mcp
 npm init -y
 npm install express pg pgvector
 ```
@@ -564,14 +564,14 @@ This replaces Slack entirely. You'll have a shortcut that:
 
 > 💡 **iPhone note:** The shortcut works identically on iPhone. If your Mac server is running on the same network, replace `localhost` with your Mac's local IP (find it in System Settings → Network, e.g., `192.168.1.42`). Or set it up to work only when on your home network.
 
-> ⚠️ **Important:** The Apple Shortcut only works when your local server is running. If you restart your Mac, you'll need to start the server again (`node server.js` from the `~/open-brain-local` directory). See Step 9 for auto-start setup.
+> ⚠️ **Important:** The Apple Shortcut only works when your local server is running. If you restart your Mac, you'll need to start the server again (`node server.js` from the `~/open-brain-mcp` directory). See Step 9 for auto-start setup.
 
 ### Step 8: Test Capture
 
 Run your server if it's not already running:
 
 ```bash
-cd ~/open-brain-local && node server.js
+cd ~/open-brain-mcp && node server.js
 ```
 
 **Test via terminal first:**
@@ -621,24 +621,24 @@ cat > ~/Library/LaunchAgents/com.open-brain.server.plist << EOF
     <key>ProgramArguments</key>
     <array>
         <string>$(which node)</string>
-        <string>$(echo ~/open-brain-local/server.js)</string>
+        <string>$(echo ~/open-brain-mcp/server.js)</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>$(echo ~/open-brain-local)</string>
+    <string>$(echo ~/open-brain-mcp)</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>$(echo ~/open-brain-local/server.log)</string>
+    <string>$(echo ~/open-brain-mcp/server.log)</string>
     <key>StandardErrorPath</key>
-    <string>$(echo ~/open-brain-local/server.err.log)</string>
+    <string>$(echo ~/open-brain-mcp/server.err.log)</string>
 </dict>
 </plist>
 EOF
 ```
 
-> ⚠️ The `$(which node)` and `$(echo ~)` substitutions will expand when you run the `cat` command. If they don't, manually replace them with the full paths (run `which node` and `echo ~/open-brain-local` to get them).
+> ⚠️ The `$(which node)` and `$(echo ~)` substitutions will expand when you run the `cat` command. If they don't, manually replace them with the full paths (run `which node` and `echo ~/open-brain-mcp` to get them).
 
 Load it:
 
@@ -989,7 +989,7 @@ Open `~/Library/Application Support/Claude/claude_desktop_config.json` (create i
   "mcpServers": {
     "open-brain": {
       "command": "node",
-      "args": ["/Users/YOUR_USERNAME/open-brain-local/mcp-server.js"],
+      "args": ["/Users/YOUR_USERNAME/open-brain-mcp/mcp-server.js"],
       "env": {
         "OPENROUTER_API_KEY": "your-openrouter-key",
         "DATABASE_URL": "postgresql://localhost:5432/open_brain"
@@ -1010,7 +1010,7 @@ Add to your MCP settings (`.vscode/mcp.json` or equivalent):
   "mcpServers": {
     "open-brain": {
       "command": "node",
-      "args": ["~/open-brain-local/mcp-server.js"],
+      "args": ["~/open-brain-mcp/mcp-server.js"],
       "env": {
         "OPENROUTER_API_KEY": "your-openrouter-key",
         "DATABASE_URL": "postgresql://localhost:5432/open_brain"
@@ -1023,7 +1023,7 @@ Add to your MCP settings (`.vscode/mcp.json` or equivalent):
 **Claude Code**
 
 ```bash
-claude mcp add open-brain -- node ~/open-brain-local/mcp-server.js
+claude mcp add open-brain -- node ~/open-brain-mcp/mcp-server.js
 ```
 
 (Set `OPENROUTER_API_KEY` and `DATABASE_URL` in your shell environment first.)
