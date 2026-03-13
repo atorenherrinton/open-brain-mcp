@@ -1,17 +1,16 @@
 require("dotenv").config();
 const express = require("express");
-const { Pool } = require("pg");
 const pgvector = require("pgvector");
+const { createPool } = require("./lib/db");
 
 // ─── Config ───────────────────────────────────────────────
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const DATABASE_URL = process.env.DATABASE_URL;
 const MCP_ACCESS_KEY = process.env.MCP_ACCESS_KEY;
 const PORT = parseInt(process.env.SERVER_PORT || "3333", 10);
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
 
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createPool();
 
 const app = express();
 app.use(express.json());

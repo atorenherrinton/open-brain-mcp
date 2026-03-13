@@ -1,8 +1,8 @@
 const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
-const { Pool } = require("pg");
 const pgvector = require("pgvector");
+const { createPool } = require("./lib/db");
 
 const envPath = path.resolve(__dirname, ".env");
 if (fs.existsSync(envPath)) {
@@ -15,11 +15,10 @@ if (fs.existsSync(envPath)) {
 }
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const DATABASE_URL = process.env.DATABASE_URL;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
 
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = createPool();
 
 // ─── AI Helpers ───────────────────────────────────────────
 async function getEmbedding(text) {
