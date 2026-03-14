@@ -136,20 +136,73 @@ async function verifyJWT(token: string, secret: string): Promise<Record<string, 
   }
 }
 
-function getBaseUrl(url: URL, functionName: string): string {
-  const path = url.pathname;
-  const idx = path.lastIndexOf(`/${functionName}`);
-  return idx === -1 ? url.origin : url.origin + path.substring(0, idx + functionName.length + 1);
+function getBaseUrl(_url: URL, functionName: string): string {
+  const supabaseUrl = (Deno.env.get("SUPABASE_URL") || _url.origin).replace(/\/$/, "");
+  return `${supabaseUrl}/functions/v1/${functionName}`;
 }
 
 function oauthMetadata(baseUrl: string): Response {
   return jsonResponse({
     issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/authorize`,
     token_endpoint: `${baseUrl}/oauth/token`,
-    token_endpoint_auth_methods_supported: ["client_secret_post"],
-    grant_types_supported: ["client_credentials"],
-    response_types_supported: [],
-    code_challenge_methods_supported: [],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+    grant_types_supported: ["authorization_code", "client_credentials"],
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+  });
+}
+
+async function sha256Base64url(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return base64url(String.fromCharCode(...new Uint8Array(hash)));
+}
+
+async function handleAuthorizeAsync(url: URL, baseUrl: string): Promise<Response> {
+  const clientId = Deno.env.get("OAUTH_CLIENT_ID") ?? "";
+  const reqClientId = url.searchParams.get("client_id") ?? "";
+  const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+  const state = url.searchParams.get("state") ?? "";
+  const codeChallenge = url.searchParams.get("code_challenge") ?? "";
+  const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? "";
+  const responseType = url.searchParams.get("response_type") ?? "";
+
+  if (responseType !== "code") {
+    return jsonResponse({ error: "unsupported_response_type" }, 400);
+  }
+  if (!clientId || reqClientId !== clientId) {
+    return jsonResponse({ error: "invalid_client" }, 401);
+  }
+  if (!redirectUri) {
+    return jsonResponse({ error: "invalid_request", error_description: "redirect_uri required" }, 400);
+  }
+  if (codeChallengeMethod && codeChallengeMethod !== "S256") {
+    return jsonResponse({ error: "invalid_request", error_description: "Only S256 code_challenge_method supported" }, 400);
+  }
+
+  const jwtSecret = Deno.env.get("OAUTH_JWT_SECRET") || Deno.env.get("OAUTH_CLIENT_SECRET") || "";
+  const now = Math.floor(Date.now() / 1000);
+  const code = await createJWT({
+    type: "auth_code",
+    sub: clientId,
+    code_challenge: codeChallenge,
+    code_challenge_method: codeChallengeMethod || "S256",
+    redirect_uri: redirectUri,
+    iat: now,
+    exp: now + 600,
+  }, jwtSecret);
+
+  const redirect = new URL(redirectUri);
+  redirect.searchParams.set("code", code);
+  if (state) redirect.searchParams.set("state", state);
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: redirect.toString(),
+      "Cache-Control": "no-store",
+    },
   });
 }
 
@@ -168,36 +221,81 @@ async function handleOAuthToken(req: Request): Promise<Response> {
     return jsonResponse({ error: "oauth_not_configured" }, 500);
   }
 
-  let grantType = "", reqId = "", reqSecret = "";
+  let grantType = "", reqId = "", reqSecret = "", code = "", codeVerifier = "", redirectUri = "";
   const ct = req.headers.get("content-type") ?? "";
   if (ct.includes("application/x-www-form-urlencoded")) {
     const params = new URLSearchParams(await req.text());
     grantType = params.get("grant_type") ?? "";
     reqId = params.get("client_id") ?? "";
     reqSecret = params.get("client_secret") ?? "";
+    code = params.get("code") ?? "";
+    codeVerifier = params.get("code_verifier") ?? "";
+    redirectUri = params.get("redirect_uri") ?? "";
   } else {
     const body = await req.json();
     grantType = body.grant_type ?? "";
     reqId = body.client_id ?? "";
     reqSecret = body.client_secret ?? "";
+    code = body.code ?? "";
+    codeVerifier = body.code_verifier ?? "";
+    redirectUri = body.redirect_uri ?? "";
   }
 
-  if (grantType !== "client_credentials") {
-    return jsonResponse({ error: "unsupported_grant_type" }, 400);
-  }
-  if (reqId !== clientId || reqSecret !== clientSecret) {
-    return jsonResponse({ error: "invalid_client" }, 401);
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  const expiresIn = 3600;
   const jwtSecret = Deno.env.get("OAUTH_JWT_SECRET") || clientSecret;
-  const token = await createJWT({ sub: clientId, iat: now, exp: now + expiresIn }, jwtSecret);
 
-  return jsonResponse({ access_token: token, token_type: "Bearer", expires_in: expiresIn });
+  if (grantType === "authorization_code") {
+    if (!code) {
+      return jsonResponse({ error: "invalid_request", error_description: "code required" }, 400);
+    }
+    const codePayload = await verifyJWT(code, jwtSecret);
+    if (!codePayload || codePayload.type !== "auth_code") {
+      return jsonResponse({ error: "invalid_grant", error_description: "Invalid or expired authorization code" }, 400);
+    }
+    if (reqId && reqId !== clientId) {
+      return jsonResponse({ error: "invalid_client" }, 401);
+    }
+    if (redirectUri && redirectUri !== codePayload.redirect_uri) {
+      return jsonResponse({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
+    }
+    if (codePayload.code_challenge) {
+      if (!codeVerifier) {
+        return jsonResponse({ error: "invalid_request", error_description: "code_verifier required" }, 400);
+      }
+      const computed = await sha256Base64url(codeVerifier);
+      if (computed !== codePayload.code_challenge) {
+        return jsonResponse({ error: "invalid_grant", error_description: "code_verifier mismatch" }, 400);
+      }
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const expiresIn = 3600;
+    const token = await createJWT({ sub: clientId, iat: now, exp: now + expiresIn }, jwtSecret);
+    return jsonResponse({ access_token: token, token_type: "Bearer", expires_in: expiresIn });
+  }
+
+  if (grantType === "client_credentials") {
+    if (reqId !== clientId || reqSecret !== clientSecret) {
+      return jsonResponse({ error: "invalid_client" }, 401);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const expiresIn = 3600;
+    const token = await createJWT({ sub: clientId, iat: now, exp: now + expiresIn }, jwtSecret);
+    return jsonResponse({ access_token: token, token_type: "Bearer", expires_in: expiresIn });
+  }
+
+  return jsonResponse({ error: "unsupported_grant_type" }, 400);
 }
 
-async function requireAuth(req: Request) {
+function authChallengeHeaders(baseUrl: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "WWW-Authenticate": `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+  };
+}
+
+async function requireAuth(req: Request, baseUrl?: string) {
+  const challengeHeaders = baseUrl ? authChallengeHeaders(baseUrl) : { "Content-Type": "application/json" };
+
   // Check for OAuth Bearer token
   const authHeader = req.headers.get("authorization");
   if (authHeader?.startsWith("Bearer ")) {
@@ -208,7 +306,7 @@ async function requireAuth(req: Request) {
     }
     throw new Response(JSON.stringify({ error: "Invalid or expired token" }), {
       status: 401,
-      headers: { "Content-Type": "application/json" },
+      headers: challengeHeaders,
     });
   }
 
@@ -221,7 +319,7 @@ async function requireAuth(req: Request) {
   if (key !== expected) {
     throw new Response(JSON.stringify({ error: "Invalid or missing access key" }), {
       status: 401,
-      headers: { "Content-Type": "application/json" },
+      headers: challengeHeaders,
     });
   }
 }
@@ -548,12 +646,15 @@ Deno.serve(async (req) => {
     if (action === ".well-known/oauth-authorization-server" || action === "mcp/.well-known/oauth-authorization-server") {
       return oauthMetadata(baseUrl);
     }
+    if (req.method === "GET" && (action === "authorize" || action === "mcp/authorize")) {
+      return await handleAuthorizeAsync(url, baseUrl);
+    }
     if (req.method === "POST" && action === "oauth/token") {
       return await handleOAuthToken(req);
     }
 
     if ((action === "" || action === "mcp") && (req.method === "POST" || req.method === "GET")) {
-      await requireAuth(req);
+      await requireAuth(req, baseUrl);
       return await handleMcpRequest(req, supabase);
     }
 
@@ -562,13 +663,13 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "POST" && action === "capture") {
-      await requireAuth(req);
+      await requireAuth(req, baseUrl);
       const { content, source } = await req.json();
       return jsonResponse(await captureThought(supabase, content, source || "edge"));
     }
 
     if (req.method === "POST" && action === "search") {
-      await requireAuth(req);
+      await requireAuth(req, baseUrl);
       const { query, limit = 10, threshold = 0.5, filter = {} } = await req.json();
       if (!query) {
         return jsonResponse({ error: "Query is required" }, 400);
@@ -579,7 +680,7 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "GET" && action === "thoughts") {
-      await requireAuth(req);
+      await requireAuth(req, baseUrl);
       const limit = Number(url.searchParams.get("limit") || "10");
       const days = url.searchParams.get("days");
       const thoughts = await listThoughts(supabase, {
@@ -593,7 +694,7 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "GET" && action === "stats") {
-      await requireAuth(req);
+      await requireAuth(req, baseUrl);
       return jsonResponse(await thoughtStats(supabase));
     }
 
