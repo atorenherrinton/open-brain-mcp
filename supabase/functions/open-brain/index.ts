@@ -336,7 +336,7 @@ function getAction(url: URL) {
 async function getThoughtCount(supabase: ReturnType<typeof createClient>) {
   const { count, error } = await supabase.from("thoughts").select("id", { count: "exact", head: true });
   if (error) {
-    throw error;
+    throw new Error(error.message || JSON.stringify(error));
   }
   return count ?? 0;
 }
@@ -371,7 +371,7 @@ async function captureThought(
   });
 
   if (error) {
-    throw error;
+    throw new Error(error.message || JSON.stringify(error));
   }
 
   const row = Array.isArray(data) ? data[0] : data;
@@ -407,7 +407,7 @@ async function searchThoughts(
   });
 
   if (error) {
-    throw error;
+    throw new Error(error.message || JSON.stringify(error));
   }
 
   return data ?? [];
@@ -432,7 +432,7 @@ async function listThoughts(
   });
 
   if (error) {
-    throw error;
+    throw new Error(error.message || JSON.stringify(error));
   }
 
   return data ?? [];
@@ -441,7 +441,7 @@ async function listThoughts(
 async function thoughtStats(supabase: ReturnType<typeof createClient>) {
   const { data, error } = await supabase.rpc("thought_stats");
   if (error) {
-    throw error;
+    throw new Error(error.message || JSON.stringify(error));
   }
 
   return (
