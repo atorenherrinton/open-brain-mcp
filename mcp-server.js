@@ -134,6 +134,97 @@ const TOOLS = [
       required: ["content"],
     },
   },
+  {
+    name: "set_personal_info",
+    description:
+      "Save or update a piece of personal information. Use this to store details like name, birthday, address, preferences, etc.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "The info key, e.g. 'full_name', 'birthday', 'favorite_color'" },
+        value: { type: "string", description: "The value to store" },
+        category: { type: "string", description: "Category for grouping, e.g. 'identity', 'preferences', 'contact', 'health' (default: 'general')", default: "general" },
+      },
+      required: ["key", "value"],
+    },
+  },
+  {
+    name: "get_personal_info",
+    description:
+      "Retrieve a specific piece of personal information by key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "The info key to look up" },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "list_personal_info",
+    description:
+      "List all stored personal information, optionally filtered by category.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: { type: "string", description: "Filter by category (e.g. 'identity', 'preferences', 'contact')" },
+      },
+    },
+  },
+  {
+    name: "search_personal_info",
+    description:
+      "Search personal information by meaning. Use this when the user asks about their details and you're not sure of the exact key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to search for" },
+        limit: { type: "number", description: "Max results (default 10)", default: 10 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.5)", default: 0.5 },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "delete_personal_info",
+    description:
+      "Delete a piece of personal information by key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "The info key to delete" },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "connect_info_to_thoughts",
+    description:
+      "Find thoughts related to a piece of personal info. Great for brainstorming — e.g. connect your resume, goals, or skills to captured thoughts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "The personal info key to match against thoughts (e.g. 'resume', 'goals', 'skills')" },
+        limit: { type: "number", description: "Max results (default 10)", default: 10 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.3)", default: 0.3 },
+      },
+      required: ["key"],
+    },
+  },
+  {
+    name: "connect_thought_to_info",
+    description:
+      "Find personal info related to a thought. Use a thought ID or a search query to find which personal details connect to a captured thought.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thought_id: { type: "string", description: "UUID of the thought to match" },
+        query: { type: "string", description: "Search query to find the thought first, then match personal info" },
+        limit: { type: "number", description: "Max results (default 10)", default: 10 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.3)", default: 0.3 },
+      },
+    },
+  },
 ];
 
 // ─── Tool Handlers ────────────────────────────────────────
@@ -282,6 +373,180 @@ async function handleCaptureThought({ content }) {
   return confirmation;
 }
 
+// ─── Personal Info Handlers ──────────────────────────────
+
+async function handleSetPersonalInfo({ key, value, category = "general" }) {
+  if (!key || !value) throw new Error("Both key and value are required.");
+
+  const embeddingText = `${key}: ${value}`;
+  const embedding = await getEmbedding(embeddingText);
+
+  const { rows } = await pool.query(
+    `INSERT INTO personal_info (key, value, category, embedding)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value,
+           category = COALESCE(EXCLUDED.category, personal_info.category),
+           embedding = EXCLUDED.embedding
+     RETURNING key, value, category`,
+    [key.toLowerCase().trim(), value.trim(), category.toLowerCase().trim(), pgvector.toSql(embedding)]
+  );
+
+  const row = rows[0];
+  return `Saved: ${row.key} = "${row.value}" (${row.category})`;
+}
+
+async function handleSearchPersonalInfo({ query, limit = 10, threshold = 0.5 }) {
+  const qEmb = await getEmbedding(query);
+  const { rows } = await pool.query(
+    `SELECT * FROM match_personal_info($1, $2, $3)`,
+    [pgvector.toSql(qEmb), threshold, limit]
+  );
+  if (!rows.length) return `No personal info found matching "${query}".`;
+
+  return rows
+    .map((r, i) => `${i + 1}. [${r.category}] ${r.key}: ${r.value} (${(r.similarity * 100).toFixed(1)}% match)`)
+    .join("\n");
+}
+
+async function handleGetPersonalInfo({ key }) {
+  if (!key) throw new Error("Key is required.");
+
+  const { rows } = await pool.query(
+    `SELECT key, value, category, updated_at FROM personal_info WHERE key = $1`,
+    [key.toLowerCase().trim()]
+  );
+
+  if (!rows.length) return `No personal info found for "${key}".`;
+
+  const row = rows[0];
+  return `${row.key}: ${row.value} (${row.category}) — updated ${new Date(row.updated_at).toLocaleDateString()}`;
+}
+
+async function handleListPersonalInfo({ category } = {}) {
+  let sql = `SELECT key, value, category, updated_at FROM personal_info`;
+  const params = [];
+
+  if (category) {
+    sql += ` WHERE category = $1`;
+    params.push(category.toLowerCase().trim());
+  }
+  sql += ` ORDER BY category, key`;
+
+  const { rows } = await pool.query(sql, params);
+  if (!rows.length) return category ? `No personal info found in category "${category}".` : "No personal info stored yet.";
+
+  let currentCat = "";
+  const lines = [];
+  for (const row of rows) {
+    if (row.category !== currentCat) {
+      currentCat = row.category;
+      lines.push(`\n[${currentCat}]`);
+    }
+    lines.push(`  ${row.key}: ${row.value}`);
+  }
+  return lines.join("\n").trim();
+}
+
+async function handleDeletePersonalInfo({ key }) {
+  if (!key) throw new Error("Key is required.");
+
+  const { rowCount } = await pool.query(
+    `DELETE FROM personal_info WHERE key = $1`,
+    [key.toLowerCase().trim()]
+  );
+
+  return rowCount ? `Deleted "${key}".` : `No personal info found for "${key}".`;
+}
+
+// ─── Cross-Reference Handlers ────────────────────────────
+
+async function handleConnectInfoToThoughts({ key, limit = 10, threshold = 0.3 }) {
+  if (!key) throw new Error("Personal info key is required.");
+
+  const { rows } = await pool.query(
+    `SELECT * FROM match_thoughts_by_personal_info($1, $2, $3, $4)`,
+    [key.toLowerCase().trim(), threshold, limit, "{}"]
+  );
+
+  if (!rows.length) return `No thoughts found related to personal info "${key}".`;
+
+  // Include the personal info context at the top
+  const { rows: infoRows } = await pool.query(
+    `SELECT key, value, category FROM personal_info WHERE key = $1`,
+    [key.toLowerCase().trim()]
+  );
+
+  const lines = [];
+  if (infoRows.length) {
+    const info = infoRows[0];
+    lines.push(`Connecting [${info.category}] ${info.key}: ${info.value}`, "");
+    lines.push(`--- ${rows.length} related thought(s) ---`, "");
+  }
+
+  for (const [i, t] of rows.entries()) {
+    const m = t.metadata || {};
+    const parts = [
+      `${i + 1}. (${(t.similarity * 100).toFixed(1)}% match) [${new Date(t.created_at).toLocaleDateString()}]`,
+    ];
+    if (m.type) parts[0] += ` (${m.type})`;
+    if (m.topics?.length) parts.push(`   Topics: ${m.topics.join(", ")}`);
+    parts.push(`   ${t.content}`);
+    lines.push(parts.join("\n"));
+  }
+
+  return lines.join("\n");
+}
+
+async function handleConnectThoughtToInfo({ thought_id, query, limit = 10, threshold = 0.3 }) {
+  if (!thought_id && !query) throw new Error("Either thought_id or query is required.");
+
+  let targetId = thought_id;
+  let thoughtContent = "";
+
+  // If query provided, find the best matching thought first
+  if (!targetId && query) {
+    const qEmb = await getEmbedding(query);
+    const { rows } = await pool.query(
+      `SELECT * FROM match_thoughts($1, $2, $3, $4)`,
+      [pgvector.toSql(qEmb), 0.3, 1, "{}"]
+    );
+    if (!rows.length) return `No thought found matching "${query}".`;
+    targetId = rows[0].id;
+    thoughtContent = rows[0].content;
+  }
+
+  // Get thought content if we only have the ID
+  if (!thoughtContent) {
+    const { rows } = await pool.query(
+      `SELECT content FROM thoughts WHERE id = $1`,
+      [targetId]
+    );
+    if (!rows.length) return `Thought "${targetId}" not found.`;
+    thoughtContent = rows[0].content;
+  }
+
+  const { rows } = await pool.query(
+    `SELECT * FROM match_personal_info_by_thought($1, $2, $3)`,
+    [targetId, threshold, limit]
+  );
+
+  if (!rows.length) return `No personal info found related to this thought.`;
+
+  const lines = [
+    `Thought: ${thoughtContent}`,
+    "",
+    `--- ${rows.length} related personal info ---`,
+    "",
+  ];
+
+  for (const [i, r] of rows.entries()) {
+    lines.push(`${i + 1}. [${r.category}] ${r.key}: ${r.value} (${(r.similarity * 100).toFixed(1)}% match)`);
+  }
+
+  return lines.join("\n");
+}
+
 // ─── MCP Message Handling ─────────────────────────────────
 
 let inputBuffer = Buffer.alloc(0);
@@ -394,6 +659,27 @@ async function handleMessage(msg) {
           break;
         case "capture_thought":
           result = await handleCaptureThought(args);
+          break;
+        case "set_personal_info":
+          result = await handleSetPersonalInfo(args);
+          break;
+        case "get_personal_info":
+          result = await handleGetPersonalInfo(args);
+          break;
+        case "search_personal_info":
+          result = await handleSearchPersonalInfo(args);
+          break;
+        case "list_personal_info":
+          result = await handleListPersonalInfo(args);
+          break;
+        case "delete_personal_info":
+          result = await handleDeletePersonalInfo(args);
+          break;
+        case "connect_info_to_thoughts":
+          result = await handleConnectInfoToThoughts(args);
+          break;
+        case "connect_thought_to_info":
+          result = await handleConnectThoughtToInfo(args);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);

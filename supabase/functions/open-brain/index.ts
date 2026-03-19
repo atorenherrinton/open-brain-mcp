@@ -612,6 +612,236 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
+  server.registerTool(
+    "set_personal_info",
+    {
+      description: "Save or update a piece of personal information (name, birthday, preferences, etc.).",
+      inputSchema: z.object({
+        key: z.string(),
+        value: z.string(),
+        category: z.string().optional(),
+      }),
+    },
+    async ({ key, value, category }) => {
+      const embeddingText = `${key}: ${value}`;
+      const embedding = await getEmbedding(embeddingText);
+      const { data, error } = await supabase.rpc("upsert_personal_info", {
+        p_key: key.toLowerCase().trim(),
+        p_value: value.trim(),
+        p_category: (category || "general").toLowerCase().trim(),
+        p_embedding: vectorLiteral(embedding),
+      });
+      if (error) throw new Error(error.message);
+      const row = Array.isArray(data) ? data[0] : data;
+      return { content: [{ type: "text", text: `Saved: ${row.key} = "${row.value}" (${row.category})` }] };
+    }
+  );
+
+  server.registerTool(
+    "get_personal_info",
+    {
+      description: "Retrieve a specific piece of personal information by key.",
+      inputSchema: z.object({ key: z.string() }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ key }) => {
+      const { data, error } = await supabase.rpc("get_personal_info", {
+        p_key: key.toLowerCase().trim(),
+      });
+      if (error) throw new Error(error.message);
+      if (!data || (Array.isArray(data) && !data.length)) {
+        return { content: [{ type: "text", text: `No personal info found for "${key}".` }] };
+      }
+      const row = Array.isArray(data) ? data[0] : data;
+      return { content: [{ type: "text", text: `${row.key}: ${row.value} (${row.category}) — updated ${new Date(row.updated_at).toLocaleDateString()}` }] };
+    }
+  );
+
+  server.registerTool(
+    "search_personal_info",
+    {
+      description: "Search personal information by meaning. Use when the user asks about their details and you're not sure of the exact key.",
+      inputSchema: z.object({
+        query: z.string(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, limit, threshold }) => {
+      const embedding = await getEmbedding(query);
+      const { data, error } = await supabase.rpc("match_personal_info", {
+        query_embedding: vectorLiteral(embedding),
+        match_threshold: threshold ?? 0.5,
+        match_count: limit ?? 10,
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) {
+        return { content: [{ type: "text", text: `No personal info found matching "${query}".` }] };
+      }
+      const text = (data as Array<Record<string, unknown>>)
+        .map((r, i) => `${i + 1}. [${String(r.category)}] ${String(r.key)}: ${String(r.value)} (${(Number(r.similarity) * 100).toFixed(1)}% match)`)
+        .join("\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.registerTool(
+    "list_personal_info",
+    {
+      description: "List all stored personal information, optionally filtered by category.",
+      inputSchema: z.object({ category: z.string().optional() }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ category }) => {
+      const { data, error } = await supabase.rpc("list_personal_info", {
+        p_category: category ? category.toLowerCase().trim() : null,
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) {
+        return { content: [{ type: "text", text: category ? `No personal info in category "${category}".` : "No personal info stored yet." }] };
+      }
+      let currentCat = "";
+      const lines: string[] = [];
+      for (const row of data as Array<Record<string, unknown>>) {
+        if (String(row.category) !== currentCat) {
+          currentCat = String(row.category);
+          lines.push(`\n[${currentCat}]`);
+        }
+        lines.push(`  ${String(row.key)}: ${String(row.value)}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n").trim() }] };
+    }
+  );
+
+  server.registerTool(
+    "delete_personal_info",
+    {
+      description: "Delete a piece of personal information by key.",
+      inputSchema: z.object({ key: z.string() }),
+    },
+    async ({ key }) => {
+      const { data, error } = await supabase.rpc("delete_personal_info", {
+        p_key: key.toLowerCase().trim(),
+      });
+      if (error) throw new Error(error.message);
+      return { content: [{ type: "text", text: data ? `Deleted "${key}".` : `No personal info found for "${key}".` }] };
+    }
+  );
+
+  server.registerTool(
+    "connect_info_to_thoughts",
+    {
+      description: "Find thoughts related to a piece of personal info. Great for brainstorming — e.g. connect your resume, goals, or skills to captured thoughts.",
+      inputSchema: z.object({
+        key: z.string(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ key, limit, threshold }) => {
+      const normalizedKey = key.toLowerCase().trim();
+
+      // Get the personal info context
+      const { data: infoData } = await supabase.rpc("get_personal_info", { p_key: normalizedKey });
+      const infoRow = Array.isArray(infoData) && infoData.length ? infoData[0] : null;
+
+      const { data, error } = await supabase.rpc("match_thoughts_by_personal_info", {
+        p_key: normalizedKey,
+        match_threshold: threshold ?? 0.3,
+        match_count: limit ?? 10,
+        filter: {},
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) {
+        return { content: [{ type: "text", text: `No thoughts found related to personal info "${key}".` }] };
+      }
+
+      const lines: string[] = [];
+      if (infoRow) {
+        lines.push(`Connecting [${String(infoRow.category)}] ${String(infoRow.key)}: ${String(infoRow.value)}`, "");
+        lines.push(`--- ${data.length} related thought(s) ---`, "");
+      }
+
+      for (const [i, t] of (data as Array<Record<string, unknown>>).entries()) {
+        const m = (t.metadata as Record<string, unknown> | null) ?? {};
+        const header = `${i + 1}. (${(Number(t.similarity) * 100).toFixed(1)}% match) [${new Date(String(t.created_at)).toLocaleDateString()}]${m.type ? ` (${String(m.type)})` : ""}`;
+        const parts = [header];
+        if (Array.isArray(m.topics) && m.topics.length) parts.push(`   Topics: ${m.topics.join(", ")}`);
+        parts.push(`   ${String(t.content)}`);
+        lines.push(parts.join("\n"));
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.registerTool(
+    "connect_thought_to_info",
+    {
+      description: "Find personal info related to a thought. Use a thought ID or a search query to find which personal details connect to a captured thought.",
+      inputSchema: z.object({
+        thought_id: z.string().optional(),
+        query: z.string().optional(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ thought_id, query, limit, threshold }) => {
+      let targetId = thought_id;
+      let thoughtContent = "";
+
+      if (!targetId && !query) {
+        throw new Error("Either thought_id or query is required.");
+      }
+
+      // If query provided, find best matching thought first
+      if (!targetId && query) {
+        const results = await searchThoughts(supabase, query, 1, 0.3);
+        const arr = results as Array<Record<string, unknown>>;
+        if (!arr.length) {
+          return { content: [{ type: "text", text: `No thought found matching "${query}".` }] };
+        }
+        targetId = String(arr[0].id);
+        thoughtContent = String(arr[0].content);
+      }
+
+      // Get thought content if we only have the ID
+      if (!thoughtContent) {
+        const { data } = await supabase.from("thoughts").select("content").eq("id", targetId).single();
+        if (!data) {
+          return { content: [{ type: "text", text: `Thought "${targetId}" not found.` }] };
+        }
+        thoughtContent = String(data.content);
+      }
+
+      const { data, error } = await supabase.rpc("match_personal_info_by_thought", {
+        p_thought_id: targetId,
+        match_threshold: threshold ?? 0.3,
+        match_count: limit ?? 10,
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) {
+        return { content: [{ type: "text", text: "No personal info found related to this thought." }] };
+      }
+
+      const lines = [
+        `Thought: ${thoughtContent}`,
+        "",
+        `--- ${data.length} related personal info ---`,
+        "",
+      ];
+
+      for (const [i, r] of (data as Array<Record<string, unknown>>).entries()) {
+        lines.push(`${i + 1}. [${String(r.category)}] ${String(r.key)}: ${String(r.value)} (${(Number(r.similarity) * 100).toFixed(1)}% match)`);
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
