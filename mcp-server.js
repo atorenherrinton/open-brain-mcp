@@ -198,6 +198,78 @@ const TOOLS = [
     },
   },
   {
+    name: "create_task",
+    description:
+      "Create a new task. Use this when the user wants to track something they need to do.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short task title" },
+        description: { type: "string", description: "Longer description or details (optional)" },
+        priority: { type: "string", description: "Priority: low, medium, or high (default: medium)", default: "medium" },
+        due_date: { type: "string", description: "Due date in YYYY-MM-DD format (optional)" },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "get_task",
+    description:
+      "Retrieve a specific task by its ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "UUID of the task" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "update_task",
+    description:
+      "Update a task's title, description, status, priority, or due date. To mark a task as done, set status to 'done'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "UUID of the task to update" },
+        title: { type: "string", description: "New title (optional)" },
+        description: { type: "string", description: "New description (optional)" },
+        status: { type: "string", description: "New status: todo, in_progress, or done" },
+        priority: { type: "string", description: "New priority: low, medium, or high" },
+        due_date: { type: "string", description: "New due date in YYYY-MM-DD format (or null to clear)" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "list_tasks",
+    description:
+      "List tasks with optional filters by status, priority, or due date.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "Filter by status: todo, in_progress, done (default: shows non-done tasks)" },
+        priority: { type: "string", description: "Filter by priority: low, medium, high" },
+        include_done: { type: "boolean", description: "Include completed tasks (default: false)", default: false },
+        limit: { type: "number", description: "Max results (default 20)", default: 20 },
+      },
+    },
+  },
+  {
+    name: "search_tasks",
+    description:
+      "Search tasks by meaning. Use when the user asks about tasks related to a topic.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to search for" },
+        limit: { type: "number", description: "Max results (default 10)", default: 10 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.5)", default: 0.5 },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "connect_info_to_thoughts",
     description:
       "Find thoughts related to a piece of personal info. Great for brainstorming — e.g. connect your resume, goals, or skills to captured thoughts.",
@@ -459,6 +531,189 @@ async function handleDeletePersonalInfo({ key }) {
   return rowCount ? `Deleted "${key}".` : `No personal info found for "${key}".`;
 }
 
+// ─── Task Handlers ───────────────────────────────────────
+
+async function handleCreateTask({ title, description, priority = "medium", due_date }) {
+  if (!title) throw new Error("Title is required.");
+
+  const validPriorities = ["low", "medium", "high"];
+  const normalizedPriority = priority.toLowerCase().trim();
+  if (!validPriorities.includes(normalizedPriority)) {
+    throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
+  }
+
+  const embeddingText = description ? `${title}: ${description}` : title;
+  const embedding = await getEmbedding(embeddingText);
+
+  const { rows } = await pool.query(
+    `INSERT INTO tasks (title, description, priority, due_date, embedding)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, title, status, priority, due_date`,
+    [title.trim(), description?.trim() || null, normalizedPriority, due_date || null, pgvector.toSql(embedding)]
+  );
+
+  const task = rows[0];
+  let confirmation = `Created task: "${task.title}" [${task.priority}]`;
+  if (task.due_date) confirmation += ` — due ${task.due_date}`;
+  confirmation += `\nID: ${task.id}`;
+  return confirmation;
+}
+
+async function handleGetTask({ task_id }) {
+  if (!task_id) throw new Error("Task ID is required.");
+
+  const { rows } = await pool.query(
+    `SELECT id, title, description, status, priority, due_date, created_at, updated_at
+     FROM tasks WHERE id = $1`,
+    [task_id]
+  );
+
+  if (!rows.length) return `No task found with ID "${task_id}".`;
+
+  const t = rows[0];
+  const lines = [
+    `Title: ${t.title}`,
+    `Status: ${t.status}`,
+    `Priority: ${t.priority}`,
+  ];
+  if (t.description) lines.push(`Description: ${t.description}`);
+  if (t.due_date) lines.push(`Due: ${t.due_date}`);
+  lines.push(`Created: ${new Date(t.created_at).toLocaleDateString()}`);
+  lines.push(`Updated: ${new Date(t.updated_at).toLocaleDateString()}`);
+  lines.push(`ID: ${t.id}`);
+  return lines.join("\n");
+}
+
+async function handleUpdateTask({ task_id, title, description, status, priority, due_date }) {
+  if (!task_id) throw new Error("Task ID is required.");
+
+  const setClauses = [];
+  const params = [];
+  let idx = 1;
+
+  if (title !== undefined) {
+    setClauses.push(`title = $${idx++}`);
+    params.push(title.trim());
+  }
+  if (description !== undefined) {
+    setClauses.push(`description = $${idx++}`);
+    params.push(description?.trim() || null);
+  }
+  if (status !== undefined) {
+    const validStatuses = ["todo", "in_progress", "done"];
+    const normalizedStatus = status.toLowerCase().trim();
+    if (!validStatuses.includes(normalizedStatus)) {
+      throw new Error(`Invalid status "${status}". Must be: ${validStatuses.join(", ")}`);
+    }
+    setClauses.push(`status = $${idx++}`);
+    params.push(normalizedStatus);
+  }
+  if (priority !== undefined) {
+    const validPriorities = ["low", "medium", "high"];
+    const normalizedPriority = priority.toLowerCase().trim();
+    if (!validPriorities.includes(normalizedPriority)) {
+      throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
+    }
+    setClauses.push(`priority = $${idx++}`);
+    params.push(normalizedPriority);
+  }
+  if (due_date !== undefined) {
+    setClauses.push(`due_date = $${idx++}`);
+    params.push(due_date || null);
+  }
+
+  if (!setClauses.length) throw new Error("No fields to update.");
+
+  // Re-embed if title or description changed
+  if (title !== undefined || description !== undefined) {
+    const { rows: current } = await pool.query(
+      `SELECT title, description FROM tasks WHERE id = $1`, [task_id]
+    );
+    if (current.length) {
+      const newTitle = title !== undefined ? title.trim() : current[0].title;
+      const newDesc = description !== undefined ? (description?.trim() || null) : current[0].description;
+      const embeddingText = newDesc ? `${newTitle}: ${newDesc}` : newTitle;
+      const embedding = await getEmbedding(embeddingText);
+      setClauses.push(`embedding = $${idx++}`);
+      params.push(pgvector.toSql(embedding));
+    }
+  }
+
+  params.push(task_id);
+  const { rows } = await pool.query(
+    `UPDATE tasks SET ${setClauses.join(", ")} WHERE id = $${idx}
+     RETURNING id, title, status, priority, due_date`,
+    params
+  );
+
+  if (!rows.length) return `No task found with ID "${task_id}".`;
+
+  const t = rows[0];
+  let confirmation = `Updated: "${t.title}" [${t.status}, ${t.priority}]`;
+  if (t.due_date) confirmation += ` — due ${t.due_date}`;
+  return confirmation;
+}
+
+async function handleListTasks({ status, priority, include_done = false, limit = 20 } = {}) {
+  let sql = `SELECT id, title, description, status, priority, due_date, created_at FROM tasks`;
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+
+  if (status) {
+    conditions.push(`status = $${idx++}`);
+    params.push(status.toLowerCase().trim());
+  } else if (!include_done) {
+    conditions.push(`status != 'done'`);
+  }
+
+  if (priority) {
+    conditions.push(`priority = $${idx++}`);
+    params.push(priority.toLowerCase().trim());
+  }
+
+  if (conditions.length) sql += ` WHERE ` + conditions.join(" AND ");
+  sql += ` ORDER BY
+    CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END,
+    CASE WHEN due_date IS NULL THEN 1 ELSE 0 END,
+    due_date ASC,
+    created_at DESC
+    LIMIT $${idx}`;
+  params.push(parseInt(limit));
+
+  const { rows } = await pool.query(sql, params);
+  if (!rows.length) return "No tasks found.";
+
+  return rows
+    .map((t, i) => {
+      const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title}`];
+      if (t.due_date) parts[0] += ` — due ${t.due_date}`;
+      if (t.description) parts.push(`   ${t.description}`);
+      parts.push(`   ID: ${t.id}`);
+      return parts.join("\n");
+    })
+    .join("\n\n");
+}
+
+async function handleSearchTasks({ query, limit = 10, threshold = 0.5 }) {
+  const qEmb = await getEmbedding(query);
+  const { rows } = await pool.query(
+    `SELECT * FROM match_tasks($1, $2, $3)`,
+    [pgvector.toSql(qEmb), threshold, limit]
+  );
+  if (!rows.length) return `No tasks found matching "${query}".`;
+
+  return rows
+    .map((t, i) => {
+      const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title} (${(t.similarity * 100).toFixed(1)}% match)`];
+      if (t.due_date) parts[0] += ` — due ${t.due_date}`;
+      if (t.description) parts.push(`   ${t.description}`);
+      parts.push(`   ID: ${t.id}`);
+      return parts.join("\n");
+    })
+    .join("\n\n");
+}
+
 // ─── Cross-Reference Handlers ────────────────────────────
 
 async function handleConnectInfoToThoughts({ key, limit = 10, threshold = 0.3 }) {
@@ -674,6 +929,21 @@ async function handleMessage(msg) {
           break;
         case "delete_personal_info":
           result = await handleDeletePersonalInfo(args);
+          break;
+        case "create_task":
+          result = await handleCreateTask(args);
+          break;
+        case "get_task":
+          result = await handleGetTask(args);
+          break;
+        case "update_task":
+          result = await handleUpdateTask(args);
+          break;
+        case "list_tasks":
+          result = await handleListTasks(args);
+          break;
+        case "search_tasks":
+          result = await handleSearchTasks(args);
           break;
         case "connect_info_to_thoughts":
           result = await handleConnectInfoToThoughts(args);
