@@ -730,6 +730,190 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   );
 
   server.registerTool(
+    "create_task",
+    {
+      description: "Create a new task. Use this when the user wants to track something they need to do.",
+      inputSchema: z.object({
+        title: z.string(),
+        description: z.string().optional(),
+        priority: z.string().optional(),
+        due_date: z.string().optional(),
+      }),
+    },
+    async ({ title, description, priority, due_date }) => {
+      const normalizedPriority = (priority || "medium").toLowerCase().trim();
+      const validPriorities = ["low", "medium", "high"];
+      if (!validPriorities.includes(normalizedPriority)) {
+        throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
+      }
+      const embeddingText = description ? `${title}: ${description}` : title;
+      const embedding = await getEmbedding(embeddingText);
+      const { data, error } = await supabase.from("tasks").insert({
+        title: title.trim(),
+        description: description?.trim() || null,
+        priority: normalizedPriority,
+        due_date: due_date || null,
+        embedding: vectorLiteral(embedding),
+      }).select("id, title, status, priority, due_date").single();
+      if (error) throw new Error(error.message);
+      let confirmation = `Created task: "${data.title}" [${data.priority}]`;
+      if (data.due_date) confirmation += ` — due ${data.due_date}`;
+      confirmation += `\nID: ${data.id}`;
+      return { content: [{ type: "text", text: confirmation }] };
+    }
+  );
+
+  server.registerTool(
+    "get_task",
+    {
+      description: "Retrieve a specific task by its ID.",
+      inputSchema: z.object({ task_id: z.string() }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ task_id }) => {
+      const { data, error } = await supabase.from("tasks")
+        .select("id, title, description, status, priority, due_date, created_at, updated_at")
+        .eq("id", task_id).single();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
+      const lines = [
+        `Title: ${data.title}`,
+        `Status: ${data.status}`,
+        `Priority: ${data.priority}`,
+      ];
+      if (data.description) lines.push(`Description: ${data.description}`);
+      if (data.due_date) lines.push(`Due: ${data.due_date}`);
+      lines.push(`Created: ${new Date(data.created_at).toLocaleDateString()}`);
+      lines.push(`Updated: ${new Date(data.updated_at).toLocaleDateString()}`);
+      lines.push(`ID: ${data.id}`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.registerTool(
+    "update_task",
+    {
+      description: "Update a task's title, description, status, priority, or due date. To mark a task as done, set status to 'done'.",
+      inputSchema: z.object({
+        task_id: z.string(),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        status: z.string().optional(),
+        priority: z.string().optional(),
+        due_date: z.string().optional(),
+      }),
+    },
+    async ({ task_id, title, description, status, priority, due_date }) => {
+      const updates: Record<string, unknown> = {};
+      if (title !== undefined) updates.title = title.trim();
+      if (description !== undefined) updates.description = description?.trim() || null;
+      if (status !== undefined) {
+        const validStatuses = ["todo", "in_progress", "done"];
+        const s = status.toLowerCase().trim();
+        if (!validStatuses.includes(s)) throw new Error(`Invalid status "${status}". Must be: ${validStatuses.join(", ")}`);
+        updates.status = s;
+      }
+      if (priority !== undefined) {
+        const validPriorities = ["low", "medium", "high"];
+        const p = priority.toLowerCase().trim();
+        if (!validPriorities.includes(p)) throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
+        updates.priority = p;
+      }
+      if (due_date !== undefined) updates.due_date = due_date || null;
+      if (!Object.keys(updates).length) throw new Error("No fields to update.");
+
+      // Re-embed if title or description changed
+      if (title !== undefined || description !== undefined) {
+        const { data: current } = await supabase.from("tasks").select("title, description").eq("id", task_id).single();
+        if (current) {
+          const newTitle = title !== undefined ? title.trim() : current.title;
+          const newDesc = description !== undefined ? (description?.trim() || null) : current.description;
+          const embeddingText = newDesc ? `${newTitle}: ${newDesc}` : newTitle;
+          updates.embedding = vectorLiteral(await getEmbedding(embeddingText));
+        }
+      }
+
+      const { data, error } = await supabase.from("tasks").update(updates).eq("id", task_id)
+        .select("id, title, status, priority, due_date").single();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
+      let confirmation = `Updated: "${data.title}" [${data.status}, ${data.priority}]`;
+      if (data.due_date) confirmation += ` — due ${data.due_date}`;
+      return { content: [{ type: "text", text: confirmation }] };
+    }
+  );
+
+  server.registerTool(
+    "list_tasks",
+    {
+      description: "List tasks with optional filters by status, priority, or due date.",
+      inputSchema: z.object({
+        status: z.string().optional(),
+        priority: z.string().optional(),
+        include_done: z.boolean().optional(),
+        limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ status, priority, include_done, limit }) => {
+      let query = supabase.from("tasks")
+        .select("id, title, description, status, priority, due_date, created_at");
+      if (status) {
+        query = query.eq("status", status.toLowerCase().trim());
+      } else if (!include_done) {
+        query = query.neq("status", "done");
+      }
+      if (priority) query = query.eq("priority", priority.toLowerCase().trim());
+      query = query.order("priority", { ascending: true })
+        .order("due_date", { ascending: true, nullsFirst: false })
+        .order("created_at", { ascending: false })
+        .limit(limit ?? 20);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: "No tasks found." }] };
+      const text = data.map((t: Record<string, unknown>, i: number) => {
+        const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title}`];
+        if (t.due_date) parts[0] += ` — due ${t.due_date}`;
+        if (t.description) parts.push(`   ${t.description}`);
+        parts.push(`   ID: ${t.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.registerTool(
+    "search_tasks",
+    {
+      description: "Search tasks by meaning. Use when the user asks about tasks related to a topic.",
+      inputSchema: z.object({
+        query: z.string(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, limit, threshold }) => {
+      const embedding = await getEmbedding(query);
+      const { data, error } = await supabase.rpc("match_tasks", {
+        query_embedding: vectorLiteral(embedding),
+        match_threshold: threshold ?? 0.5,
+        match_count: limit ?? 10,
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: `No tasks found matching "${query}".` }] };
+      const text = (data as Array<Record<string, unknown>>).map((t, i) => {
+        const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title} (${(Number(t.similarity) * 100).toFixed(1)}% match)`];
+        if (t.due_date) parts[0] += ` — due ${t.due_date}`;
+        if (t.description) parts.push(`   ${t.description}`);
+        parts.push(`   ID: ${t.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.registerTool(
     "connect_info_to_thoughts",
     {
       description: "Find thoughts related to a piece of personal info. Great for brainstorming — e.g. connect your resume, goals, or skills to captured thoughts.",
