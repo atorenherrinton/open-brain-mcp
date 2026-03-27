@@ -786,6 +786,20 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       lines.push(`Created: ${new Date(data.created_at).toLocaleDateString()}`);
       lines.push(`Updated: ${new Date(data.updated_at).toLocaleDateString()}`);
       lines.push(`ID: ${data.id}`);
+
+      // Fetch associated notes
+      const { data: notes } = await supabase.from("task_notes")
+        .select("id, content, type, created_at")
+        .eq("task_id", task_id)
+        .order("created_at", { ascending: false })
+        .limit(10);
+      if (notes && notes.length) {
+        lines.push("", `--- ${notes.length} note(s) ---`);
+        for (const n of notes as Array<Record<string, unknown>>) {
+          lines.push(`  [${n.type}] ${new Date(String(n.created_at)).toLocaleDateString()}: ${n.content}`);
+        }
+      }
+
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
   );
@@ -907,6 +921,135 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
         parts.push(`   ID: ${t.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  // ─── Task Notes ──────────────────────────────────────────────────────
+
+  server.registerTool(
+    "add_task_note",
+    {
+      description: "Add a note or deliverable to a task. Use type 'note' for general notes and 'deliverable' for specific outputs/artifacts.",
+      inputSchema: z.object({
+        task_id: z.string(),
+        content: z.string(),
+        type: z.string().optional(),
+      }),
+    },
+    async ({ task_id, content, type }) => {
+      const noteType = (type || "note").toLowerCase().trim();
+      const embedding = await getEmbedding(content);
+      const { data, error } = await supabase.from("task_notes").insert({
+        task_id,
+        content: content.trim(),
+        type: noteType,
+        embedding: vectorLiteral(embedding),
+      }).select("id, task_id, type, created_at").single();
+      if (error) throw new Error(error.message);
+      return { content: [{ type: "text", text: `Added ${data.type} to task ${data.task_id}\nNote ID: ${data.id}` }] };
+    }
+  );
+
+  server.registerTool(
+    "list_task_notes",
+    {
+      description: "List all notes and deliverables for a specific task.",
+      inputSchema: z.object({
+        task_id: z.string(),
+        type: z.string().optional(),
+        limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ task_id, type, limit }) => {
+      let query = supabase.from("task_notes")
+        .select("id, content, type, created_at, updated_at")
+        .eq("task_id", task_id);
+      if (type) query = query.eq("type", type.toLowerCase().trim());
+      query = query.order("created_at", { ascending: false }).limit(limit ?? 20);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: `No notes found for task "${task_id}".` }] };
+      const text = data.map((n: Record<string, unknown>, i: number) => {
+        const parts = [`${i + 1}. [${n.type}] ${new Date(String(n.created_at)).toLocaleDateString()}`];
+        parts.push(`   ${n.content}`);
+        parts.push(`   ID: ${n.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.registerTool(
+    "update_task_note",
+    {
+      description: "Update the content or type of an existing task note.",
+      inputSchema: z.object({
+        note_id: z.string(),
+        content: z.string().optional(),
+        type: z.string().optional(),
+      }),
+    },
+    async ({ note_id, content, type }) => {
+      const updates: Record<string, unknown> = {};
+      if (content !== undefined) updates.content = content.trim();
+      if (type !== undefined) updates.type = type.toLowerCase().trim();
+      if (!Object.keys(updates).length) throw new Error("No fields to update.");
+      if (content !== undefined) {
+        updates.embedding = vectorLiteral(await getEmbedding(content.trim()));
+      }
+      const { data, error } = await supabase.from("task_notes").update(updates).eq("id", note_id)
+        .select("id, task_id, type").single();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No note found with ID "${note_id}".` }] };
+      return { content: [{ type: "text", text: `Updated ${data.type} (${data.id}) on task ${data.task_id}.` }] };
+    }
+  );
+
+  server.registerTool(
+    "delete_task_note",
+    {
+      description: "Delete a task note by its ID.",
+      inputSchema: z.object({ note_id: z.string() }),
+    },
+    async ({ note_id }) => {
+      const { data, error } = await supabase.from("task_notes").delete().eq("id", note_id)
+        .select("id").single();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No note found with ID "${note_id}".` }] };
+      return { content: [{ type: "text", text: `Deleted note ${data.id}.` }] };
+    }
+  );
+
+  server.registerTool(
+    "search_task_notes",
+    {
+      description: "Search task notes by meaning. Optionally scope to a specific task.",
+      inputSchema: z.object({
+        query: z.string(),
+        task_id: z.string().optional(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, task_id, limit, threshold }) => {
+      const embedding = await getEmbedding(query);
+      const { data, error } = await supabase.rpc("match_task_notes", {
+        query_embedding: vectorLiteral(embedding),
+        match_threshold: threshold ?? 0.5,
+        match_count: limit ?? 10,
+        p_task_id: task_id || null,
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: `No task notes found matching "${query}".` }] };
+      const text = (data as Array<Record<string, unknown>>).map((n, i) => {
+        const parts = [`${i + 1}. [${n.type}] (${(Number(n.similarity) * 100).toFixed(1)}% match)`];
+        parts.push(`   ${n.content}`);
+        parts.push(`   Task: ${n.task_id} | Note: ${n.id}`);
         return parts.join("\n");
       }).join("\n\n");
       return { content: [{ type: "text", text }] };
