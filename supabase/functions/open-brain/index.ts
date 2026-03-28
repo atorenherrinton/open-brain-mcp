@@ -729,18 +729,177 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
+  // ── Project tools ──
+
+  server.registerTool(
+    "create_project",
+    {
+      description: "Create a new project. Projects group related tasks together.",
+      inputSchema: z.object({
+        name: z.string(),
+        description: z.string().optional(),
+      }),
+    },
+    async ({ name, description }) => {
+      const embeddingText = description ? `${name}: ${description}` : name;
+      const embedding = await getEmbedding(embeddingText);
+      const { data, error } = await supabase.from("projects").insert({
+        name: name.trim(),
+        description: description?.trim() || null,
+        embedding: vectorLiteral(embedding),
+      }).select("id, name, status").single();
+      if (error) throw new Error(error.message);
+      let confirmation = `Created project: "${data.name}" [${data.status}]`;
+      confirmation += `\nID: ${data.id}`;
+      return { content: [{ type: "text", text: confirmation }] };
+    }
+  );
+
+  server.registerTool(
+    "get_project",
+    {
+      description: "Retrieve a specific project by its ID.",
+      inputSchema: z.object({ project_id: z.string() }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ project_id }) => {
+      const { data, error } = await supabase.from("projects")
+        .select("id, name, description, status, created_at, updated_at")
+        .eq("id", project_id).single();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No project found with ID "${project_id}".` }] };
+      // Count tasks in this project
+      const { count } = await supabase.from("tasks")
+        .select("id", { count: "exact", head: true })
+        .eq("project_id", project_id);
+      const lines = [
+        `Name: ${data.name}`,
+        `Status: ${data.status}`,
+      ];
+      if (data.description) lines.push(`Description: ${data.description}`);
+      lines.push(`Tasks: ${count ?? 0}`);
+      lines.push(`Created: ${new Date(data.created_at).toLocaleDateString()}`);
+      lines.push(`Updated: ${new Date(data.updated_at).toLocaleDateString()}`);
+      lines.push(`ID: ${data.id}`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.registerTool(
+    "update_project",
+    {
+      description: "Update a project's name, description, or status. Set status to 'archived' to archive a project.",
+      inputSchema: z.object({
+        project_id: z.string(),
+        name: z.string().optional(),
+        description: z.string().optional(),
+        status: z.string().optional(),
+      }),
+    },
+    async ({ project_id, name, description, status }) => {
+      const updates: Record<string, unknown> = {};
+      if (name !== undefined) updates.name = name.trim();
+      if (description !== undefined) updates.description = description?.trim() || null;
+      if (status !== undefined) {
+        const validStatuses = ["active", "archived"];
+        const s = status.toLowerCase().trim();
+        if (!validStatuses.includes(s)) throw new Error(`Invalid status "${status}". Must be: ${validStatuses.join(", ")}`);
+        updates.status = s;
+      }
+      if (!Object.keys(updates).length) throw new Error("No fields to update.");
+
+      // Re-embed if name or description changed
+      if (name !== undefined || description !== undefined) {
+        const { data: current } = await supabase.from("projects").select("name, description").eq("id", project_id).single();
+        if (current) {
+          const newName = name !== undefined ? name.trim() : current.name;
+          const newDesc = description !== undefined ? (description?.trim() || null) : current.description;
+          const embeddingText = newDesc ? `${newName}: ${newDesc}` : newName;
+          updates.embedding = vectorLiteral(await getEmbedding(embeddingText));
+        }
+      }
+
+      const { data, error } = await supabase.from("projects").update(updates).eq("id", project_id)
+        .select("id, name, status").single();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No project found with ID "${project_id}".` }] };
+      return { content: [{ type: "text", text: `Updated project: "${data.name}" [${data.status}]` }] };
+    }
+  );
+
+  server.registerTool(
+    "list_projects",
+    {
+      description: "List projects with optional status filter.",
+      inputSchema: z.object({
+        include_archived: z.boolean().optional(),
+        limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ include_archived, limit }) => {
+      let query = supabase.from("projects")
+        .select("id, name, description, status, created_at");
+      if (!include_archived) query = query.eq("status", "active");
+      query = query.order("created_at", { ascending: false }).limit(limit ?? 20);
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: "No projects found." }] };
+      const text = data.map((p: Record<string, unknown>, i: number) => {
+        const parts = [`${i + 1}. [${p.status}] ${p.name}`];
+        if (p.description) parts.push(`   ${p.description}`);
+        parts.push(`   ID: ${p.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.registerTool(
+    "search_projects",
+    {
+      description: "Search projects by meaning.",
+      inputSchema: z.object({
+        query: z.string(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, limit, threshold }) => {
+      const embedding = await getEmbedding(query);
+      const { data, error } = await supabase.rpc("match_projects", {
+        query_embedding: vectorLiteral(embedding),
+        match_threshold: threshold ?? 0.5,
+        match_count: limit ?? 10,
+      });
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: `No projects found matching "${query}".` }] };
+      const text = (data as Array<Record<string, unknown>>).map((p, i) => {
+        const parts = [`${i + 1}. [${p.status}] ${p.name} (${(Number(p.similarity) * 100).toFixed(1)}% match)`];
+        if (p.description) parts.push(`   ${p.description}`);
+        parts.push(`   ID: ${p.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  // ── Task tools ──
+
   server.registerTool(
     "create_task",
     {
-      description: "Create a new task. Use this when the user wants to track something they need to do.",
+      description: "Create a new task. Use this when the user wants to track something they need to do. Optionally assign to a project.",
       inputSchema: z.object({
         title: z.string(),
         description: z.string().optional(),
         priority: z.string().optional(),
         due_date: z.string().optional(),
+        project_id: z.string().optional(),
       }),
     },
-    async ({ title, description, priority, due_date }) => {
+    async ({ title, description, priority, due_date, project_id }) => {
       const normalizedPriority = (priority || "medium").toLowerCase().trim();
       const validPriorities = ["low", "medium", "high"];
       if (!validPriorities.includes(normalizedPriority)) {
@@ -753,11 +912,13 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         description: description?.trim() || null,
         priority: normalizedPriority,
         due_date: due_date || null,
+        project_id: project_id || null,
         embedding: vectorLiteral(embedding),
-      }).select("id, title, status, priority, due_date").single();
+      }).select("id, title, status, priority, due_date, project_id").single();
       if (error) throw new Error(error.message);
       let confirmation = `Created task: "${data.title}" [${data.priority}]`;
       if (data.due_date) confirmation += ` — due ${data.due_date}`;
+      if (data.project_id) confirmation += ` — project ${data.project_id}`;
       confirmation += `\nID: ${data.id}`;
       return { content: [{ type: "text", text: confirmation }] };
     }
@@ -772,7 +933,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ task_id }) => {
       const { data, error } = await supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, created_at, updated_at")
+        .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at")
         .eq("id", task_id).single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
@@ -783,6 +944,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       ];
       if (data.description) lines.push(`Description: ${data.description}`);
       if (data.due_date) lines.push(`Due: ${data.due_date}`);
+      if (data.project_id) lines.push(`Project ID: ${data.project_id}`);
       lines.push(`Created: ${new Date(data.created_at).toLocaleDateString()}`);
       lines.push(`Updated: ${new Date(data.updated_at).toLocaleDateString()}`);
       lines.push(`ID: ${data.id}`);
@@ -807,7 +969,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "update_task",
     {
-      description: "Update a task's title, description, status, priority, or due date. To mark a task as done, set status to 'done'.",
+      description: "Update a task's title, description, status, priority, due date, or project. To mark a task as done, set status to 'done'.",
       inputSchema: z.object({
         task_id: z.string(),
         title: z.string().optional(),
@@ -815,9 +977,10 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         status: z.string().optional(),
         priority: z.string().optional(),
         due_date: z.string().optional(),
+        project_id: z.string().optional(),
       }),
     },
-    async ({ task_id, title, description, status, priority, due_date }) => {
+    async ({ task_id, title, description, status, priority, due_date, project_id }) => {
       const updates: Record<string, unknown> = {};
       if (title !== undefined) updates.title = title.trim();
       if (description !== undefined) updates.description = description?.trim() || null;
@@ -834,6 +997,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         updates.priority = p;
       }
       if (due_date !== undefined) updates.due_date = due_date || null;
+      if (project_id !== undefined) updates.project_id = project_id || null;
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
 
       // Re-embed if title or description changed
@@ -860,24 +1024,26 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "list_tasks",
     {
-      description: "List tasks with optional filters by status, priority, or due date.",
+      description: "List tasks with optional filters by status, priority, project, or due date.",
       inputSchema: z.object({
         status: z.string().optional(),
         priority: z.string().optional(),
+        project_id: z.string().optional(),
         include_done: z.boolean().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ status, priority, include_done, limit }) => {
+    async ({ status, priority, project_id, include_done, limit }) => {
       let query = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, created_at");
+        .select("id, title, description, status, priority, due_date, project_id, created_at");
       if (status) {
         query = query.eq("status", status.toLowerCase().trim());
       } else if (!include_done) {
         query = query.neq("status", "done");
       }
       if (priority) query = query.eq("priority", priority.toLowerCase().trim());
+      if (project_id) query = query.eq("project_id", project_id);
       query = query.order("priority", { ascending: true })
         .order("due_date", { ascending: true, nullsFirst: false })
         .order("created_at", { ascending: false })
@@ -889,6 +1055,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title}`];
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
+        if (t.project_id) parts.push(`   Project: ${t.project_id}`);
         parts.push(`   ID: ${t.id}`);
         return parts.join("\n");
       }).join("\n\n");
@@ -920,6 +1087,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title} (${(Number(t.similarity) * 100).toFixed(1)}% match)`];
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
+        if (t.project_id) parts.push(`   Project: ${t.project_id}`);
         parts.push(`   ID: ${t.id}`);
         return parts.join("\n");
       }).join("\n\n");
