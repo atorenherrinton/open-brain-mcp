@@ -278,7 +278,7 @@ const TOOLS = [
       properties: {
         key: { type: "string", description: "The personal info key to match against thoughts (e.g. 'resume', 'goals', 'skills')" },
         limit: { type: "number", description: "Max results (default 10)", default: 10 },
-        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.3)", default: 0.3 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.5)", default: 0.5 },
       },
       required: ["key"],
     },
@@ -293,7 +293,7 @@ const TOOLS = [
         thought_id: { type: "string", description: "UUID of the thought to match" },
         query: { type: "string", description: "Search query to find the thought first, then match personal info" },
         limit: { type: "number", description: "Max results (default 10)", default: 10 },
-        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.3)", default: 0.3 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.5)", default: 0.5 },
       },
     },
   },
@@ -716,7 +716,7 @@ async function handleSearchTasks({ query, limit = 10, threshold = 0.5 }) {
 
 // ─── Cross-Reference Handlers ────────────────────────────
 
-async function handleConnectInfoToThoughts({ key, limit = 10, threshold = 0.3 }) {
+async function handleConnectInfoToThoughts({ key, limit = 10, threshold = 0.5 }) {
   if (!key) throw new Error("Personal info key is required.");
 
   const { rows } = await pool.query(
@@ -753,7 +753,7 @@ async function handleConnectInfoToThoughts({ key, limit = 10, threshold = 0.3 })
   return lines.join("\n");
 }
 
-async function handleConnectThoughtToInfo({ thought_id, query, limit = 10, threshold = 0.3 }) {
+async function handleConnectThoughtToInfo({ thought_id, query, limit = 10, threshold = 0.5 }) {
   if (!thought_id && !query) throw new Error("Either thought_id or query is required.");
 
   let targetId = thought_id;
@@ -764,7 +764,7 @@ async function handleConnectThoughtToInfo({ thought_id, query, limit = 10, thres
     const qEmb = await getEmbedding(query);
     const { rows } = await pool.query(
       `SELECT * FROM match_thoughts($1, $2, $3, $4)`,
-      [pgvector.toSql(qEmb), 0.3, 1, "{}"]
+      [pgvector.toSql(qEmb), 0.5, 1, "{}"]
     );
     if (!rows.length) return `No thought found matching "${query}".`;
     targetId = rows[0].id;

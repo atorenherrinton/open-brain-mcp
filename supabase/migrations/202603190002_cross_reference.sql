@@ -1,7 +1,7 @@
 -- Match thoughts using a personal_info row's embedding
 create or replace function public.match_thoughts_by_personal_info(
   p_key text,
-  match_threshold float default 0.3,
+  match_threshold float default 0.5,
   match_count int default 10,
   filter jsonb default '{}'::jsonb
 )
@@ -45,7 +45,7 @@ $$;
 -- Match personal_info using a thought row's embedding
 create or replace function public.match_personal_info_by_thought(
   p_thought_id uuid,
-  match_threshold float default 0.3,
+  match_threshold float default 0.5,
   match_count int default 10
 )
 returns table (

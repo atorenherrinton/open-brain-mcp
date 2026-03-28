@@ -1244,7 +1244,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
 
       const { data, error } = await supabase.rpc("match_thoughts_by_personal_info", {
         p_key: normalizedKey,
-        match_threshold: threshold ?? 0.3,
+        match_threshold: threshold ?? 0.5,
         match_count: limit ?? 10,
         filter: {},
       });
@@ -1294,7 +1294,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
 
       // If query provided, find best matching thought first
       if (!targetId && query) {
-        const results = await searchThoughts(supabase, query, 1, 0.3);
+        const results = await searchThoughts(supabase, query, 1, 0.5);
         const arr = results as Array<Record<string, unknown>>;
         if (!arr.length) {
           return { content: [{ type: "text", text: `No thought found matching "${query}".` }] };
@@ -1314,7 +1314,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
 
       const { data, error } = await supabase.rpc("match_personal_info_by_thought", {
         p_thought_id: targetId,
-        match_threshold: threshold ?? 0.3,
+        match_threshold: threshold ?? 0.5,
         match_count: limit ?? 10,
       });
       if (error) throw new Error(error.message);

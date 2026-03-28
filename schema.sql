@@ -126,7 +126,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION match_thoughts_by_personal_info(
   p_key TEXT,
-  match_threshold FLOAT DEFAULT 0.3,
+  match_threshold FLOAT DEFAULT 0.5,
   match_count INT DEFAULT 10,
   filter JSONB DEFAULT '{}'::jsonb
 )
@@ -168,7 +168,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION match_personal_info_by_thought(
   p_thought_id UUID,
-  match_threshold FLOAT DEFAULT 0.3,
+  match_threshold FLOAT DEFAULT 0.5,
   match_count INT DEFAULT 10
 )
 RETURNS TABLE (
