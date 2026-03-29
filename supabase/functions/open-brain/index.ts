@@ -841,6 +841,37 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
+  server.registerTool(
+    "search_projects",
+    {
+      description: "Search projects by name or description.",
+      inputSchema: z.object({
+        query: z.string(),
+        include_archived: z.boolean().optional(),
+        limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, include_archived, limit }) => {
+      const pattern = `%${query}%`;
+      let q = supabase.from("projects")
+        .select("id, name, description, status, created_at")
+        .or(`name.ilike.${pattern},description.ilike.${pattern}`);
+      if (!include_archived) q = q.eq("status", "active");
+      q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
+      const { data, error } = await q;
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: `No projects found matching "${query}".` }] };
+      const text = data.map((p: Record<string, unknown>, i: number) => {
+        const parts = [`${i + 1}. [${p.status}] ${p.name}`];
+        if (p.description) parts.push(`   ${p.description}`);
+        parts.push(`   ID: ${p.id}`);
+        return parts.join("\n");
+      }).join("\n\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
   // ── Task tools ──
 
   server.registerTool(
