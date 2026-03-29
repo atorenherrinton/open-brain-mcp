@@ -892,15 +892,12 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (!validPriorities.includes(normalizedPriority)) {
         throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
       }
-      const embeddingText = description ? `${title}: ${description}` : title;
-      const embedding = await getEmbedding(embeddingText);
       const { data, error } = await supabase.from("tasks").insert({
         title: title.trim(),
         description: description?.trim() || null,
         priority: normalizedPriority,
         due_date: due_date || null,
         project_id: project_id || null,
-        embedding: vectorLiteral(embedding),
       }).select("id, title, status, priority, due_date, project_id").single();
       if (error) throw new Error(error.message);
       let confirmation = `Created task: "${data.title}" [${data.priority}]`;
@@ -987,17 +984,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (project_id !== undefined) updates.project_id = project_id || null;
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
 
-      // Re-embed if title or description changed
-      if (title !== undefined || description !== undefined) {
-        const { data: current } = await supabase.from("tasks").select("title, description").eq("id", task_id).single();
-        if (current) {
-          const newTitle = title !== undefined ? title.trim() : current.title;
-          const newDesc = description !== undefined ? (description?.trim() || null) : current.description;
-          const embeddingText = newDesc ? `${newTitle}: ${newDesc}` : newTitle;
-          updates.embedding = vectorLiteral(await getEmbedding(embeddingText));
-        }
-      }
-
       const { data, error } = await supabase.from("tasks").update(updates).eq("id", task_id)
         .select("id, title, status, priority, due_date").single();
       if (error) throw new Error(error.message);
@@ -1053,25 +1039,26 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "search_tasks",
     {
-      description: "Search tasks by meaning. Use when the user asks about tasks related to a topic.",
+      description: "Search tasks by title, description, status, or priority.",
       inputSchema: z.object({
         query: z.string(),
+        include_done: z.boolean().optional(),
         limit: z.number().optional(),
-        threshold: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ query, limit, threshold }) => {
-      const embedding = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_tasks", {
-        query_embedding: vectorLiteral(embedding),
-        match_threshold: threshold ?? 0.5,
-        match_count: limit ?? 10,
-      });
+    async ({ query, include_done, limit }) => {
+      const pattern = `%${query}%`;
+      let q = supabase.from("tasks")
+        .select("id, title, description, status, priority, due_date, project_id, created_at")
+        .or(`title.ilike.${pattern},description.ilike.${pattern},status.ilike.${pattern},priority.ilike.${pattern}`);
+      if (!include_done) q = q.neq("status", "done");
+      q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
+      const { data, error } = await q;
       if (error) throw new Error(error.message);
       if (!data || !data.length) return { content: [{ type: "text", text: `No tasks found matching "${query}".` }] };
       const text = (data as Array<Record<string, unknown>>).map((t, i) => {
-        const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title} (${(Number(t.similarity) * 100).toFixed(1)}% match)`];
+        const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title}`];
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
         if (t.project_id) parts.push(`   Project: ${t.project_id}`);
@@ -1096,12 +1083,10 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ task_id, content, type }) => {
       const noteType = (type || "note").toLowerCase().trim();
-      const embedding = await getEmbedding(content);
       const { data, error } = await supabase.from("task_notes").insert({
         task_id,
         content: content.trim(),
         type: noteType,
-        embedding: vectorLiteral(embedding),
       }).select("id, task_id, type, created_at").single();
       if (error) throw new Error(error.message);
       return { content: [{ type: "text", text: `Added ${data.type} to task ${data.task_id}\nNote ID: ${data.id}` }] };
@@ -1153,9 +1138,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (content !== undefined) updates.content = content.trim();
       if (type !== undefined) updates.type = type.toLowerCase().trim();
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
-      if (content !== undefined) {
-        updates.embedding = vectorLiteral(await getEmbedding(content.trim()));
-      }
       const { data, error } = await supabase.from("task_notes").update(updates).eq("id", note_id)
         .select("id, task_id, type").single();
       if (error) throw new Error(error.message);
@@ -1182,27 +1164,26 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "search_task_notes",
     {
-      description: "Search task notes by meaning. Optionally scope to a specific task.",
+      description: "Search task notes by content or type. Optionally scope to a specific task.",
       inputSchema: z.object({
         query: z.string(),
         task_id: z.string().optional(),
         limit: z.number().optional(),
-        threshold: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ query, task_id, limit, threshold }) => {
-      const embedding = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_task_notes", {
-        query_embedding: vectorLiteral(embedding),
-        match_threshold: threshold ?? 0.5,
-        match_count: limit ?? 10,
-        p_task_id: task_id || null,
-      });
+    async ({ query, task_id, limit }) => {
+      const pattern = `%${query}%`;
+      let q = supabase.from("task_notes")
+        .select("id, task_id, content, type, created_at")
+        .or(`content.ilike.${pattern},type.ilike.${pattern}`);
+      if (task_id) q = q.eq("task_id", task_id);
+      q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
+      const { data, error } = await q;
       if (error) throw new Error(error.message);
       if (!data || !data.length) return { content: [{ type: "text", text: `No task notes found matching "${query}".` }] };
       const text = (data as Array<Record<string, unknown>>).map((n, i) => {
-        const parts = [`${i + 1}. [${n.type}] (${(Number(n.similarity) * 100).toFixed(1)}% match)`];
+        const parts = [`${i + 1}. [${n.type}] ${new Date(String(n.created_at)).toLocaleDateString()}`];
         parts.push(`   ${n.content}`);
         parts.push(`   Task: ${n.task_id} | Note: ${n.id}`);
         return parts.join("\n");
