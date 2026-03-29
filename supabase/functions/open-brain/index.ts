@@ -741,12 +741,9 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }),
     },
     async ({ name, description }) => {
-      const embeddingText = description ? `${name}: ${description}` : name;
-      const embedding = await getEmbedding(embeddingText);
       const { data, error } = await supabase.from("projects").insert({
         name: name.trim(),
         description: description?.trim() || null,
-        embedding: vectorLiteral(embedding),
       }).select("id, name, status").single();
       if (error) throw new Error(error.message);
       let confirmation = `Created project: "${data.name}" [${data.status}]`;
@@ -808,17 +805,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
 
-      // Re-embed if name or description changed
-      if (name !== undefined || description !== undefined) {
-        const { data: current } = await supabase.from("projects").select("name, description").eq("id", project_id).single();
-        if (current) {
-          const newName = name !== undefined ? name.trim() : current.name;
-          const newDesc = description !== undefined ? (description?.trim() || null) : current.description;
-          const embeddingText = newDesc ? `${newName}: ${newDesc}` : newName;
-          updates.embedding = vectorLiteral(await getEmbedding(embeddingText));
-        }
-      }
-
       const { data, error } = await supabase.from("projects").update(updates).eq("id", project_id)
         .select("id, name, status").single();
       if (error) throw new Error(error.message);
@@ -847,36 +833,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (!data || !data.length) return { content: [{ type: "text", text: "No projects found." }] };
       const text = data.map((p: Record<string, unknown>, i: number) => {
         const parts = [`${i + 1}. [${p.status}] ${p.name}`];
-        if (p.description) parts.push(`   ${p.description}`);
-        parts.push(`   ID: ${p.id}`);
-        return parts.join("\n");
-      }).join("\n\n");
-      return { content: [{ type: "text", text }] };
-    }
-  );
-
-  server.registerTool(
-    "search_projects",
-    {
-      description: "Search projects by meaning.",
-      inputSchema: z.object({
-        query: z.string(),
-        limit: z.number().optional(),
-        threshold: z.number().optional(),
-      }),
-      annotations: { readOnlyHint: true },
-    },
-    async ({ query, limit, threshold }) => {
-      const embedding = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_projects", {
-        query_embedding: vectorLiteral(embedding),
-        match_threshold: threshold ?? 0.5,
-        match_count: limit ?? 10,
-      });
-      if (error) throw new Error(error.message);
-      if (!data || !data.length) return { content: [{ type: "text", text: `No projects found matching "${query}".` }] };
-      const text = (data as Array<Record<string, unknown>>).map((p, i) => {
-        const parts = [`${i + 1}. [${p.status}] ${p.name} (${(Number(p.similarity) * 100).toFixed(1)}% match)`];
         if (p.description) parts.push(`   ${p.description}`);
         parts.push(`   ID: ${p.id}`);
         return parts.join("\n");
