@@ -544,6 +544,49 @@ app.post("/webhooks/task-for-ai", (req, res) => {
   res.json({ ok: true, queued: record.id });
 });
 
+// Fetch all assignee=ai status=todo tasks from Supabase and enqueue them.
+// Shared between the admin endpoint and the startup sweep so they can't drift.
+async function dispatchPendingTasks({ projectId, logTag = "dispatch-pending" } = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    throw new Error("SUPABASE_URL and SUPABASE_SECRET_KEY required");
+  }
+
+  const params = new URLSearchParams({
+    select: "id,title,description,priority,due_date,working_dir",
+    assignee: "eq.ai",
+    status: "eq.todo",
+  });
+  if (projectId) params.set("project_id", `eq.${projectId}`);
+
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tasks?${params}`, {
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    },
+  });
+  if (!r.ok) throw new Error(`supabase ${r.status} ${await r.text().catch(() => "")}`);
+  const tasks = await r.json();
+
+  let queued = 0;
+  let skipped = 0;
+  for (const t of tasks) {
+    if (!t.working_dir) {
+      console.log(`[${logTag}] skipping task ${t.id} (no working_dir)`);
+      skipped++;
+      continue;
+    }
+    if (inFlight.has(t.id)) {
+      skipped++;
+      continue;
+    }
+    enqueueTask(t);
+    queued++;
+  }
+
+  console.log(`[${logTag}] queued=${queued} skipped=${skipped} total=${tasks.length}`);
+  return { queued, skipped, total: tasks.length };
+}
+
 // Admin endpoint: re-enqueue all assignee=ai status=todo tasks from the
 // database into the in-memory queue. Useful after a dispatcher restart
 // (the queue is in-memory and not persisted) or when the loop-guard has
@@ -559,50 +602,29 @@ app.post("/admin/dispatch-pending", async (req, res) => {
     return res.status(500).json({ error: "SUPABASE_URL and SUPABASE_SECRET_KEY required" });
   }
 
-  const projectId = req.body?.project_id;
-  const params = new URLSearchParams({
-    select: "id,title,description,priority,due_date,working_dir",
-    assignee: "eq.ai",
-    status: "eq.todo",
-  });
-  if (projectId) params.set("project_id", `eq.${projectId}`);
-
-  let tasks;
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/tasks?${params}`, {
-      headers: {
-        apikey: SUPABASE_SECRET_KEY,
-        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
-      },
+    const result = await dispatchPendingTasks({
+      projectId: req.body?.project_id,
+      logTag: "admin",
     });
-    if (!r.ok) throw new Error(`supabase ${r.status} ${await r.text().catch(() => "")}`);
-    tasks = await r.json();
+    res.json({ ok: true, ...result });
   } catch (err) {
-    return res.status(502).json({ error: `failed to read tasks: ${err.message}` });
+    res.status(502).json({ error: `failed to read tasks: ${err.message}` });
   }
-
-  let queued = 0;
-  let skipped = 0;
-  for (const t of tasks) {
-    if (!t.working_dir) {
-      console.log(`[admin] skipping task ${t.id} (no working_dir)`);
-      skipped++;
-      continue;
-    }
-    if (inFlight.has(t.id)) {
-      skipped++;
-      continue;
-    }
-    enqueueTask(t);
-    queued++;
-  }
-
-  console.log(`[admin] dispatch-pending: queued=${queued} skipped=${skipped} total=${tasks.length}`);
-  res.json({ ok: true, queued, skipped, total: tasks.length });
 });
 
 // ─── Start ────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🧠 Open Brain server running at http://localhost:${PORT}`);
   console.log(`   Health check: http://localhost:${PORT}/health`);
+
+  // Sweep for any assignee=ai status=todo tasks that were sitting in the
+  // database while the dispatcher was down. The in-memory queue doesn't
+  // survive restarts, so without this any task created during downtime
+  // would wait until something else nudged its row.
+  if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
+    dispatchPendingTasks({ logTag: "startup" }).catch((err) => {
+      console.error(`[startup] failed to sweep pending tasks: ${err.message}`);
+    });
+  }
 });
