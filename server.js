@@ -377,6 +377,56 @@ async function runWorker() {
   workerRunning = false;
 }
 
+// Run `git` in the given working dir and capture stdout/stderr.
+function gitCapture(cwd, args) {
+  return new Promise((resolve) => {
+    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (b) => (stdout += b.toString()));
+    child.stderr.on("data", (b) => (stderr += b.toString()));
+    child.on("error", (err) => resolve({ code: -1, stdout, stderr: err.message }));
+    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+// Verify a dispatched agent actually committed and pushed everything before
+// we mark the task done. Returns { ok: true } or { ok: false, reason }.
+async function verifyWorkPushed(cwd) {
+  // 1. No uncommitted changes to TRACKED files? We pass --untracked-files=no
+  // because the in-container Claude Code creates a `.claude/` project-state
+  // directory in the cwd as a side effect — that's untracked noise we don't
+  // care about, not work the agent forgot to commit.
+  const status = await gitCapture(cwd, ["status", "--porcelain", "--untracked-files=no"]);
+  if (status.code !== 0) {
+    return { ok: false, reason: `git status failed (exit ${status.code}): ${status.stderr.trim()}` };
+  }
+  if (status.stdout.trim() !== "") {
+    return {
+      ok: false,
+      reason: `working tree has uncommitted changes to tracked files after agent exit:\n${status.stdout.trim()}`,
+    };
+  }
+
+  // 2. Branch not ahead of upstream? (i.e. nothing committed-but-unpushed)
+  const ahead = await gitCapture(cwd, ["rev-list", "--count", "@{u}..HEAD"]);
+  if (ahead.code !== 0) {
+    return {
+      ok: false,
+      reason: `git rev-list @{u}..HEAD failed (exit ${ahead.code}): ${ahead.stderr.trim()}`,
+    };
+  }
+  const aheadCount = parseInt(ahead.stdout.trim(), 10);
+  if (Number.isNaN(aheadCount) || aheadCount > 0) {
+    return {
+      ok: false,
+      reason: `local branch is ${aheadCount} commit(s) ahead of upstream — agent failed to push`,
+    };
+  }
+
+  return { ok: true };
+}
+
 async function dispatchTask(task) {
   const cwd = translateWorkingDir(task.working_dir);
   if (!cwd) throw new Error("task has no working_dir");
@@ -413,8 +463,25 @@ async function dispatchTask(task) {
     throw err;
   }
 
+  // Don't trust claude's exit code alone — `claude -p` exits 0 whenever it
+  // produces a final response, even if that response is "I gave up because
+  // git push failed." Verify the work actually landed on the remote before
+  // marking the task done. Two checks:
+  //   1. Working tree must be clean (no leftover uncommitted changes).
+  //   2. The local branch must not be ahead of its upstream (everything
+  //      committed in this run has been pushed).
+  // If either check fails, leave the task at in_progress and record why.
+  const verification = await verifyWorkPushed(cwd);
+  if (!verification.ok) {
+    await addTaskNoteRest(
+      task.id,
+      `AI dispatch produced unverified work — leaving task at in_progress for human review.\n\n${verification.reason}\n\nstderr tail:\n${stderrTail}`
+    );
+    throw new Error(`task ${task.id} failed verification: ${verification.reason}`);
+  }
+
   await updateTaskRest(task.id, { status: "done" });
-  console.log(`[ai-dispatch] task ${task.id} completed`);
+  console.log(`[ai-dispatch] task ${task.id} completed (verified pushed)`);
 }
 
 // Supabase database webhook receiver.
@@ -455,6 +522,63 @@ app.post("/webhooks/task-for-ai", (req, res) => {
   });
 
   res.json({ ok: true, queued: record.id });
+});
+
+// Admin endpoint: re-enqueue all assignee=ai status=todo tasks from the
+// database into the in-memory queue. Useful after a dispatcher restart
+// (the queue is in-memory and not persisted) or when the loop-guard has
+// caused webhooks to be silently ignored. Same auth as the webhook.
+//
+// Optional JSON body: { project_id?: string } to scope to one project.
+app.post("/admin/dispatch-pending", async (req, res) => {
+  const secret = req.headers["x-webhook-secret"];
+  if (!TASK_WEBHOOK_SECRET || secret !== TASK_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "invalid webhook secret" });
+  }
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    return res.status(500).json({ error: "SUPABASE_URL and SUPABASE_SECRET_KEY required" });
+  }
+
+  const projectId = req.body?.project_id;
+  const params = new URLSearchParams({
+    select: "id,title,description,priority,due_date,working_dir",
+    assignee: "eq.ai",
+    status: "eq.todo",
+  });
+  if (projectId) params.set("project_id", `eq.${projectId}`);
+
+  let tasks;
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/tasks?${params}`, {
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      },
+    });
+    if (!r.ok) throw new Error(`supabase ${r.status} ${await r.text().catch(() => "")}`);
+    tasks = await r.json();
+  } catch (err) {
+    return res.status(502).json({ error: `failed to read tasks: ${err.message}` });
+  }
+
+  let queued = 0;
+  let skipped = 0;
+  for (const t of tasks) {
+    if (!t.working_dir) {
+      console.log(`[admin] skipping task ${t.id} (no working_dir)`);
+      skipped++;
+      continue;
+    }
+    if (inFlight.has(t.id)) {
+      skipped++;
+      continue;
+    }
+    enqueueTask(t);
+    queued++;
+  }
+
+  console.log(`[admin] dispatch-pending: queued=${queued} skipped=${skipped} total=${tasks.length}`);
+  res.json({ ok: true, queued, skipped, total: tasks.length });
 });
 
 // ─── Start ────────────────────────────────────────────────
