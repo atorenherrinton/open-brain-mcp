@@ -291,11 +291,18 @@ function buildPrompt(task) {
   if (task.due_date) lines.push(`Due: ${task.due_date}`);
   lines.push(
     "",
-    "Complete this task in the current working directory. Then exit.",
+    "Complete this task in the current working directory.",
+    "",
+    "When the work is done, commit your changes on the current branch with a clear",
+    "message describing what you did, then push to the tracking remote. Use a single",
+    "commit unless the work is genuinely independent. Do NOT force-push, do NOT",
+    "rebase published history, and do NOT switch branches.",
     "",
     "Task state (in_progress/done) is managed by the dispatcher — you do not need",
-    "to update it yourself. Just do the work and exit cleanly. If the work is",
-    "impossible, write a brief explanation to stderr and exit with a non-zero code.",
+    "to update it yourself. Just do the work, commit, push, and exit cleanly. If the",
+    "work is impossible or unsafe to push, write a brief explanation to stderr and",
+    "exit with a non-zero code (the dispatcher will leave the task in_progress and",
+    "save your stderr as a task note).",
   );
   return lines.join("\n");
 }
