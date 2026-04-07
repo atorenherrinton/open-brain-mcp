@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const pgvector = require("pgvector");
+const { spawn } = require("child_process");
 const { createPool } = require("./lib/db");
 
 // ─── Config ───────────────────────────────────────────────
@@ -9,6 +10,14 @@ const MCP_ACCESS_KEY = process.env.MCP_ACCESS_KEY;
 const PORT = parseInt(process.env.SERVER_PORT || "3333", 10);
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
+
+// ─── AI task dispatch config ──────────────────────────────
+const TASK_WEBHOOK_SECRET = process.env.TASK_WEBHOOK_SECRET;
+const HOST_WORKSPACES_ROOT = process.env.HOST_WORKSPACES_ROOT || "";
+const CONTAINER_WORKSPACES_ROOT = process.env.CONTAINER_WORKSPACES_ROOT || "";
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
 const pool = createPool();
 
@@ -250,6 +259,195 @@ app.get("/stats", requireKey, async (req, res) => {
     console.error("Stats error:", err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── AI task dispatch ─────────────────────────────────────
+//
+// Supabase database webhooks call POST /webhooks/task-for-ai whenever a task
+// row is inserted or updated. Rows where assignee='ai' AND status='todo' are
+// queued and run serially through `claude -p` with cwd=working_dir. Each
+// invocation is a fresh, stateless Claude Code session — no clearing needed.
+
+// Translate a host filesystem path (as stored in the DB) into the path that
+// the same files are mounted at inside this container. If the path doesn't
+// live under the configured host root, return it unchanged.
+function translateWorkingDir(hostPath) {
+  if (!hostPath) return null;
+  if (HOST_WORKSPACES_ROOT && CONTAINER_WORKSPACES_ROOT && hostPath.startsWith(HOST_WORKSPACES_ROOT)) {
+    return CONTAINER_WORKSPACES_ROOT + hostPath.slice(HOST_WORKSPACES_ROOT.length);
+  }
+  return hostPath;
+}
+
+function buildPrompt(task) {
+  const lines = [
+    "You are an autonomous Claude Code agent dispatched by the Open Brain task system.",
+    "",
+    `Task ID: ${task.id}`,
+    `Title: ${task.title}`,
+  ];
+  if (task.description) lines.push(`Description: ${task.description}`);
+  if (task.priority) lines.push(`Priority: ${task.priority}`);
+  if (task.due_date) lines.push(`Due: ${task.due_date}`);
+  lines.push(
+    "",
+    "Complete this task in the current working directory. Then exit.",
+    "",
+    "Task state (in_progress/done) is managed by the dispatcher — you do not need",
+    "to update it yourself. Just do the work and exit cleanly. If the work is",
+    "impossible, write a brief explanation to stderr and exit with a non-zero code.",
+  );
+  return lines.join("\n");
+}
+
+// Update a task row via Supabase REST API. We can't use the lib/db.js postgres
+// pool from this container (its connection string is unset for this deployment),
+// and we don't want to require Open Brain MCP inside the container, so REST is
+// the simplest path. service_role key is required to write tasks.
+async function updateTaskRest(taskId, patch) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    throw new Error("SUPABASE_URL and SUPABASE_SECRET_KEY must be set to manage task state");
+  }
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/tasks?id=eq.${encodeURIComponent(taskId)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`supabase task update failed: ${res.status} ${body}`);
+  }
+}
+
+async function addTaskNoteRest(taskId, content) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return;
+  await fetch(`${SUPABASE_URL}/rest/v1/task_notes`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ task_id: taskId, content, type: "note" }),
+  }).catch((err) => console.error(`[ai-dispatch] failed to add task note: ${err.message}`));
+}
+
+// Serial queue: one Claude invocation at a time. Tracks in-flight task IDs so
+// repeated webhook deliveries for the same row are deduped.
+const taskQueue = [];
+const inFlight = new Set();
+let workerRunning = false;
+
+function enqueueTask(task) {
+  if (inFlight.has(task.id)) {
+    console.log(`[ai-dispatch] task ${task.id} already queued/running, skipping`);
+    return;
+  }
+  inFlight.add(task.id);
+  taskQueue.push(task);
+  console.log(`[ai-dispatch] enqueued task ${task.id} "${task.title}" (queue depth: ${taskQueue.length})`);
+  if (!workerRunning) runWorker();
+}
+
+async function runWorker() {
+  workerRunning = true;
+  while (taskQueue.length) {
+    const task = taskQueue.shift();
+    try {
+      await dispatchTask(task);
+    } catch (err) {
+      console.error(`[ai-dispatch] task ${task.id} failed:`, err);
+    } finally {
+      inFlight.delete(task.id);
+    }
+  }
+  workerRunning = false;
+}
+
+async function dispatchTask(task) {
+  const cwd = translateWorkingDir(task.working_dir);
+  if (!cwd) throw new Error("task has no working_dir");
+
+  // Mark in_progress so the same row doesn't immediately re-trigger via UPDATE
+  // and so the user can see live state in the dashboard.
+  await updateTaskRest(task.id, { status: "in_progress" });
+
+  const prompt = buildPrompt(task);
+  console.log(`[ai-dispatch] running claude for task ${task.id} in ${cwd}`);
+
+  let stderrTail = "";
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(
+        CLAUDE_BIN,
+        ["-p", prompt, "--dangerously-skip-permissions"],
+        { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] }
+      );
+      child.stdout.on("data", (b) => process.stdout.write(`[task ${task.id}] ${b}`));
+      child.stderr.on("data", (b) => {
+        stderrTail = (stderrTail + b.toString()).slice(-2000);
+        process.stderr.write(`[task ${task.id}] ${b}`);
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`claude exited with code ${code}`));
+      });
+    });
+  } catch (err) {
+    // Leave the task at in_progress so it doesn't auto-retry, and record why.
+    await addTaskNoteRest(task.id, `AI dispatch failed: ${err.message}\n\nstderr tail:\n${stderrTail}`);
+    throw err;
+  }
+
+  await updateTaskRest(task.id, { status: "done" });
+  console.log(`[ai-dispatch] task ${task.id} completed`);
+}
+
+// Supabase database webhook receiver.
+// Expected payload (Supabase "Database Webhook" format):
+//   { type: "INSERT"|"UPDATE"|"DELETE", table, record, old_record, schema }
+app.post("/webhooks/task-for-ai", (req, res) => {
+  const secret = req.headers["x-webhook-secret"];
+  if (!TASK_WEBHOOK_SECRET || secret !== TASK_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "invalid webhook secret" });
+  }
+
+  const { type, record, old_record } = req.body || {};
+  if (type === "DELETE" || !record) return res.json({ ok: true, ignored: "not an upsert" });
+
+  // A task is "active" (eligible for dispatch) if it's assigned to ai and
+  // its status is either todo or in_progress. Including in_progress lets
+  // users hand off mid-flight tasks to the agent.
+  const isActive = (r) => r && r.assignee === "ai" && (r.status === "todo" || r.status === "in_progress");
+  if (!isActive(record)) return res.json({ ok: true, ignored: "not an ai task in todo/in_progress" });
+
+  // For UPDATEs, only fire when the row *newly* enters the active state.
+  // This prevents two kinds of loops:
+  //   1. Our own dispatcher writes status=in_progress before spawning Claude;
+  //      that UPDATE would otherwise re-fire the webhook.
+  //   2. Unrelated edits (e.g. priority bump) on an already-active row would
+  //      otherwise re-dispatch the same task.
+  if (type === "UPDATE" && isActive(old_record)) {
+    return res.json({ ok: true, ignored: "already active" });
+  }
+
+  enqueueTask({
+    id: record.id,
+    title: record.title,
+    description: record.description,
+    priority: record.priority,
+    due_date: record.due_date,
+    working_dir: record.working_dir,
+  });
+
+  res.json({ ok: true, queued: record.id });
 });
 
 // ─── Start ────────────────────────────────────────────────

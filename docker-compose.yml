@@ -29,11 +29,38 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/open_brain
       SERVER_PORT: 3333
+      # AI task dispatch — translate host paths in the DB to container mounts
+      HOST_WORKSPACES_ROOT: ${HOST_WORKSPACES_ROOT:-${HOME}/Documents/GitHub}
+      CONTAINER_WORKSPACES_ROOT: /workspaces
+      # Long-lived Claude Code OAuth token (from `claude setup-token` on host)
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Supabase REST API access for dispatcher → tasks state updates
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
     ports:
       - "3333:3333"
+    volumes:
+      # Claude Code state directory (sessions, plugins, mcp config, history)
+      - ${HOME}/.claude:/home/node/.claude
+      # Claude Code credentials file — lives next to ~/.claude, not inside it
+      - ${HOME}/.claude.json:/home/node/.claude.json
+      # SSH keys for git over SSH
+      - ${HOME}/.ssh:/home/node/.ssh:ro
+      # Git identity
+      - ${HOME}/.gitconfig:/home/node/.gitconfig:ro
+      # Repos that AI tasks can work in
+      - ${HOST_WORKSPACES_ROOT:-${HOME}/Documents/GitHub}:/workspaces
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: open-brain-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
-      postgres:
-        condition: service_healthy
+      - api
+    profiles: ["tunnel"]
 
   mcp:
     build:

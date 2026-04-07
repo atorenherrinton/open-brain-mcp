@@ -877,20 +877,30 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "create_task",
     {
-      description: "Create a new task. Use this when the user wants to track something they need to do. Optionally assign to a project.",
+      description: "Create a new task. Use this when the user wants to track something they need to do. Set assignee to 'ai' to dispatch the task to a Claude Code agent (requires working_dir). Optionally assign to a project.",
       inputSchema: z.object({
         title: z.string(),
         description: z.string().optional(),
         priority: z.string().optional(),
         due_date: z.string().optional(),
         project_id: z.string().optional(),
+        assignee: z.string().optional(),
+        working_dir: z.string().optional(),
       }),
     },
-    async ({ title, description, priority, due_date, project_id }) => {
+    async ({ title, description, priority, due_date, project_id, assignee, working_dir }) => {
       const normalizedPriority = (priority || "medium").toLowerCase().trim();
       const validPriorities = ["low", "medium", "high"];
       if (!validPriorities.includes(normalizedPriority)) {
         throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
+      }
+      const normalizedAssignee = (assignee || "human").toLowerCase().trim();
+      const validAssignees = ["human", "ai"];
+      if (!validAssignees.includes(normalizedAssignee)) {
+        throw new Error(`Invalid assignee "${assignee}". Must be: ${validAssignees.join(", ")}`);
+      }
+      if (normalizedAssignee === "ai" && !working_dir) {
+        throw new Error("AI tasks require a working_dir (absolute host path where Claude Code should run).");
       }
       const { data, error } = await supabase.from("tasks").insert({
         title: title.trim(),
@@ -898,11 +908,14 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         priority: normalizedPriority,
         due_date: due_date || null,
         project_id: project_id || null,
-      }).select("id, title, status, priority, due_date, project_id").single();
+        assignee: normalizedAssignee,
+        working_dir: working_dir?.trim() || null,
+      }).select("id, title, status, priority, due_date, project_id, assignee, working_dir").single();
       if (error) throw new Error(error.message);
-      let confirmation = `Created task: "${data.title}" [${data.priority}]`;
+      let confirmation = `Created task: "${data.title}" [${data.priority}] [${data.assignee}]`;
       if (data.due_date) confirmation += ` — due ${data.due_date}`;
       if (data.project_id) confirmation += ` — project ${data.project_id}`;
+      if (data.working_dir) confirmation += `\nWorking dir: ${data.working_dir}`;
       confirmation += `\nID: ${data.id}`;
       return { content: [{ type: "text", text: confirmation }] };
     }
@@ -917,7 +930,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ task_id }) => {
       const { data, error } = await supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at")
+        .select("id, title, description, status, priority, due_date, project_id, assignee, working_dir, created_at, updated_at")
         .eq("id", task_id).single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
@@ -925,10 +938,12 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         `Title: ${data.title}`,
         `Status: ${data.status}`,
         `Priority: ${data.priority}`,
+        `Assignee: ${data.assignee}`,
       ];
       if (data.description) lines.push(`Description: ${data.description}`);
       if (data.due_date) lines.push(`Due: ${data.due_date}`);
       if (data.project_id) lines.push(`Project ID: ${data.project_id}`);
+      if (data.working_dir) lines.push(`Working dir: ${data.working_dir}`);
       lines.push(`Created: ${new Date(data.created_at).toLocaleDateString()}`);
       lines.push(`Updated: ${new Date(data.updated_at).toLocaleDateString()}`);
       lines.push(`ID: ${data.id}`);
@@ -953,7 +968,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "update_task",
     {
-      description: "Update a task's title, description, status, priority, due date, or project. To mark a task as done, set status to 'done'.",
+      description: "Update a task's title, description, status, priority, due date, project, assignee, or working_dir. To mark a task as done, set status to 'done'. Setting assignee to 'ai' will dispatch the task to a Claude Code agent (requires working_dir).",
       inputSchema: z.object({
         task_id: z.string(),
         title: z.string().optional(),
@@ -962,9 +977,11 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         priority: z.string().optional(),
         due_date: z.string().optional(),
         project_id: z.string().optional(),
+        assignee: z.string().optional(),
+        working_dir: z.string().optional(),
       }),
     },
-    async ({ task_id, title, description, status, priority, due_date, project_id }) => {
+    async ({ task_id, title, description, status, priority, due_date, project_id, assignee, working_dir }) => {
       const updates: Record<string, unknown> = {};
       if (title !== undefined) updates.title = title.trim();
       if (description !== undefined) updates.description = description?.trim() || null;
@@ -982,14 +999,22 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }
       if (due_date !== undefined) updates.due_date = due_date || null;
       if (project_id !== undefined) updates.project_id = project_id || null;
+      if (assignee !== undefined) {
+        const validAssignees = ["human", "ai"];
+        const a = assignee.toLowerCase().trim();
+        if (!validAssignees.includes(a)) throw new Error(`Invalid assignee "${assignee}". Must be: ${validAssignees.join(", ")}`);
+        updates.assignee = a;
+      }
+      if (working_dir !== undefined) updates.working_dir = working_dir?.trim() || null;
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
 
       const { data, error } = await supabase.from("tasks").update(updates).eq("id", task_id)
-        .select("id, title, status, priority, due_date").single();
+        .select("id, title, status, priority, due_date, assignee, working_dir").single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
-      let confirmation = `Updated: "${data.title}" [${data.status}, ${data.priority}]`;
+      let confirmation = `Updated: "${data.title}" [${data.status}, ${data.priority}, ${data.assignee}]`;
       if (data.due_date) confirmation += ` — due ${data.due_date}`;
+      if (data.working_dir) confirmation += `\nWorking dir: ${data.working_dir}`;
       return { content: [{ type: "text", text: confirmation }] };
     }
   );
@@ -997,19 +1022,20 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "list_tasks",
     {
-      description: "List tasks with optional filters by status, priority, project, or due date.",
+      description: "List tasks with optional filters by status, priority, project, assignee, or due date.",
       inputSchema: z.object({
         status: z.string().optional(),
         priority: z.string().optional(),
         project_id: z.string().optional(),
+        assignee: z.string().optional(),
         include_done: z.boolean().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ status, priority, project_id, include_done, limit }) => {
+    async ({ status, priority, project_id, assignee, include_done, limit }) => {
       let query = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, created_at");
+        .select("id, title, description, status, priority, due_date, project_id, assignee, working_dir, created_at");
       if (status) {
         query = query.eq("status", status.toLowerCase().trim());
       } else if (!include_done) {
@@ -1017,6 +1043,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }
       if (priority) query = query.eq("priority", priority.toLowerCase().trim());
       if (project_id) query = query.eq("project_id", project_id);
+      if (assignee) query = query.eq("assignee", assignee.toLowerCase().trim());
       query = query.order("priority", { ascending: true })
         .order("due_date", { ascending: true, nullsFirst: false })
         .order("created_at", { ascending: false })
@@ -1025,10 +1052,11 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (error) throw new Error(error.message);
       if (!data || !data.length) return { content: [{ type: "text", text: "No tasks found." }] };
       const text = data.map((t: Record<string, unknown>, i: number) => {
-        const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title}`];
+        const parts = [`${i + 1}. [${t.status}] [${t.priority}] [${t.assignee}] ${t.title}`];
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
         if (t.project_id) parts.push(`   Project: ${t.project_id}`);
+        if (t.working_dir) parts.push(`   Working dir: ${t.working_dir}`);
         parts.push(`   ID: ${t.id}`);
         return parts.join("\n");
       }).join("\n\n");
@@ -1039,29 +1067,32 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "search_tasks",
     {
-      description: "Search tasks by title, description, status, or priority.",
+      description: "Search tasks by title, description, status, priority, or assignee.",
       inputSchema: z.object({
         query: z.string(),
+        assignee: z.string().optional(),
         include_done: z.boolean().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ query, include_done, limit }) => {
+    async ({ query, assignee, include_done, limit }) => {
       const pattern = `%${query}%`;
       let q = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, created_at")
-        .or(`title.ilike.${pattern},description.ilike.${pattern},status.ilike.${pattern},priority.ilike.${pattern}`);
+        .select("id, title, description, status, priority, due_date, project_id, assignee, working_dir, created_at")
+        .or(`title.ilike.${pattern},description.ilike.${pattern},status.ilike.${pattern},priority.ilike.${pattern},assignee.ilike.${pattern}`);
+      if (assignee) q = q.eq("assignee", assignee.toLowerCase().trim());
       if (!include_done) q = q.neq("status", "done");
       q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
       const { data, error } = await q;
       if (error) throw new Error(error.message);
       if (!data || !data.length) return { content: [{ type: "text", text: `No tasks found matching "${query}".` }] };
       const text = (data as Array<Record<string, unknown>>).map((t, i) => {
-        const parts = [`${i + 1}. [${t.status}] [${t.priority}] ${t.title}`];
+        const parts = [`${i + 1}. [${t.status}] [${t.priority}] [${t.assignee}] ${t.title}`];
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
         if (t.project_id) parts.push(`   Project: ${t.project_id}`);
+        if (t.working_dir) parts.push(`   Working dir: ${t.working_dir}`);
         parts.push(`   ID: ${t.id}`);
         return parts.join("\n");
       }).join("\n\n");
