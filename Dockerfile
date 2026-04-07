@@ -10,7 +10,7 @@ RUN npm ci --omit=dev \
   && npm install -g @anthropic-ai/claude-code
 
 COPY lib ./lib
-COPY server.js mcp-server.js ./
+COPY server.js ./
 
 # Run as the unprivileged 'node' user (UID 1000) so Claude Code allows
 # --dangerously-skip-permissions, which it refuses to honor as root.
