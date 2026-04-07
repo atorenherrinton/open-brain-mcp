@@ -264,8 +264,10 @@ app.get("/stats", requireKey, async (req, res) => {
 // ─── AI task dispatch ─────────────────────────────────────
 //
 // Supabase database webhooks call POST /webhooks/task-for-ai whenever a task
-// row is inserted or updated. Rows where assignee='ai' AND status='todo' are
-// queued and run serially through `claude -p` with cwd=working_dir. Each
+// row is inserted or updated. Rows where status='todo' are queued and run
+// serially through `claude -p` with cwd=working_dir. The agent itself decides
+// whether the task is suitable code work for that directory; if not, it exits
+// cleanly without committing and the dispatcher records it as skipped. Each
 // invocation is a fresh, stateless Claude Code session — no clearing needed.
 
 // Translate a host filesystem path (as stored in the DB) into the path that
@@ -291,7 +293,15 @@ function buildPrompt(task) {
   if (task.due_date) lines.push(`Due: ${task.due_date}`);
   lines.push(
     "",
-    "Complete this task in the current working directory.",
+    "FIRST, decide whether this task is actually appropriate software work for",
+    "the current working directory. The task system dispatches every todo task",
+    "here automatically, so some will be personal reminders, real-world actions,",
+    "or work that belongs in a different repo. If the task is not suitable code",
+    "work for THIS directory, write a one-line explanation to stderr (e.g.",
+    "\"skip: personal reminder, not a code task\") and exit WITHOUT making any",
+    "commits. The dispatcher will detect the no-op and record a skip note.",
+    "",
+    "If the task IS suitable, complete it in the current working directory.",
     "",
     "When the work is done, commit your changes on the current branch with a clear",
     "message describing what you did, then push to the tracking remote. Use a single",
@@ -299,10 +309,10 @@ function buildPrompt(task) {
     "rebase published history, and do NOT switch branches.",
     "",
     "Task state (in_progress/done) is managed by the dispatcher — you do not need",
-    "to update it yourself. Just do the work, commit, push, and exit cleanly. If the",
-    "work is impossible or unsafe to push, write a brief explanation to stderr and",
-    "exit with a non-zero code (the dispatcher will leave the task in_progress and",
-    "save your stderr as a task note).",
+    "to update it yourself. Just do the work (or skip), commit and push if you did",
+    "work, and exit cleanly. If the work is impossible or unsafe to push, write a",
+    "brief explanation to stderr and exit with a non-zero code (the dispatcher will",
+    "leave the task in_progress and save your stderr as a task note).",
   );
   return lines.join("\n");
 }
@@ -455,6 +465,12 @@ async function dispatchTask(task) {
   // and so the user can see live state in the dashboard.
   await updateTaskRest(task.id, { status: "in_progress" });
 
+  // Capture HEAD before running so we can tell whether the agent made any
+  // commits at all. "No new commits" is the signal that the agent chose to
+  // skip because the task wasn't suitable code work for this directory.
+  const headBefore = await gitCapture(cwd, ["rev-parse", "HEAD"]);
+  const headBeforeSha = headBefore.code === 0 ? headBefore.stdout.trim() : null;
+
   const prompt = buildPrompt(task);
   console.log(`[ai-dispatch] running claude for task ${task.id} in ${cwd}`);
 
@@ -481,6 +497,22 @@ async function dispatchTask(task) {
     // Leave the task at in_progress so it doesn't auto-retry, and record why.
     await addTaskNoteRest(task.id, `AI dispatch failed: ${err.message}\n\nstderr tail:\n${stderrTail}`);
     throw err;
+  }
+
+  // If HEAD is unchanged the agent made no commits — treat that as a
+  // self-declared skip. Add a note with whatever it wrote to stderr and
+  // leave the task at in_progress so the human can triage it without it
+  // re-dispatching on every webhook.
+  const headAfter = await gitCapture(cwd, ["rev-parse", "HEAD"]);
+  const headAfterSha = headAfter.code === 0 ? headAfter.stdout.trim() : null;
+  if (headBeforeSha && headAfterSha && headBeforeSha === headAfterSha) {
+    const reason = stderrTail.trim() || "(no stderr output)";
+    await addTaskNoteRest(
+      task.id,
+      `AI dispatch skipped — agent made no commits. Leaving task at in_progress for human triage.\n\nAgent stderr:\n${reason}`
+    );
+    console.log(`[ai-dispatch] task ${task.id} skipped by agent (no new commits)`);
+    return;
   }
 
   // Don't trust claude's exit code alone — `claude -p` exits 0 whenever it
@@ -516,11 +548,13 @@ app.post("/webhooks/task-for-ai", (req, res) => {
   const { type, record, old_record } = req.body || {};
   if (type === "DELETE" || !record) return res.json({ ok: true, ignored: "not an upsert" });
 
-  // A task is "active" (eligible for dispatch) if it's assigned to ai and
-  // its status is either todo or in_progress. Including in_progress lets
-  // users hand off mid-flight tasks to the agent.
-  const isActive = (r) => r && r.assignee === "ai" && (r.status === "todo" || r.status === "in_progress");
-  if (!isActive(record)) return res.json({ ok: true, ignored: "not an ai task in todo/in_progress" });
+  // A task is "active" (eligible for dispatch) if its status is todo. We do
+  // NOT treat in_progress as active here: in_progress means either the
+  // dispatcher is currently running it, or the agent already looked at it
+  // once (and either skipped or is awaiting verification). Re-dispatching
+  // those would just spin.
+  const isActive = (r) => r && r.status === "todo";
+  if (!isActive(record)) return res.json({ ok: true, ignored: "not a todo task" });
 
   // For UPDATEs, only fire when the row *newly* enters the active state.
   // This prevents two kinds of loops:
@@ -544,7 +578,7 @@ app.post("/webhooks/task-for-ai", (req, res) => {
   res.json({ ok: true, queued: record.id });
 });
 
-// Fetch all assignee=ai status=todo tasks from Supabase and enqueue them.
+// Fetch all status=todo tasks from Supabase and enqueue them.
 // Shared between the admin endpoint and the startup sweep so they can't drift.
 async function dispatchPendingTasks({ projectId, logTag = "dispatch-pending" } = {}) {
   if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
@@ -553,7 +587,6 @@ async function dispatchPendingTasks({ projectId, logTag = "dispatch-pending" } =
 
   const params = new URLSearchParams({
     select: "id,title,description,priority,due_date,working_dir",
-    assignee: "eq.ai",
     status: "eq.todo",
   });
   if (projectId) params.set("project_id", `eq.${projectId}`);
@@ -570,11 +603,6 @@ async function dispatchPendingTasks({ projectId, logTag = "dispatch-pending" } =
   let queued = 0;
   let skipped = 0;
   for (const t of tasks) {
-    if (!t.working_dir) {
-      console.log(`[${logTag}] skipping task ${t.id} (no working_dir)`);
-      skipped++;
-      continue;
-    }
     if (inFlight.has(t.id)) {
       skipped++;
       continue;
@@ -587,7 +615,7 @@ async function dispatchPendingTasks({ projectId, logTag = "dispatch-pending" } =
   return { queued, skipped, total: tasks.length };
 }
 
-// Admin endpoint: re-enqueue all assignee=ai status=todo tasks from the
+// Admin endpoint: re-enqueue all status=todo tasks from the
 // database into the in-memory queue. Useful after a dispatcher restart
 // (the queue is in-memory and not persisted) or when the loop-guard has
 // caused webhooks to be silently ignored. Same auth as the webhook.
@@ -618,10 +646,10 @@ app.listen(PORT, () => {
   console.log(`🧠 Open Brain server running at http://localhost:${PORT}`);
   console.log(`   Health check: http://localhost:${PORT}/health`);
 
-  // Sweep for any assignee=ai status=todo tasks that were sitting in the
-  // database while the dispatcher was down. The in-memory queue doesn't
-  // survive restarts, so without this any task created during downtime
-  // would wait until something else nudged its row.
+  // Sweep for any status=todo tasks that were sitting in the database while
+  // the dispatcher was down. The in-memory queue doesn't survive restarts,
+  // so without this any task created during downtime would wait until
+  // something else nudged its row.
   if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
     dispatchPendingTasks({ logTag: "startup" }).catch((err) => {
       console.error(`[startup] failed to sweep pending tasks: ${err.message}`);
