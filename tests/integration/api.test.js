@@ -3,7 +3,6 @@
 const request = require('supertest');
 
 // ─── Module mocks (hoisted before any require) ────────────
-jest.mock('child_process', () => ({ spawn: jest.fn() }));
 jest.mock('pgvector', () => ({ toSql: jest.fn((v) => v) }));
 
 // Shared mock pool — mutated per-test to simulate DB responses.
@@ -15,21 +14,13 @@ jest.mock('../../lib/db', () => ({
 
 // ─── Environment setup ────────────────────────────────────
 const VALID_KEY = 'test-access-key';
-const VALID_SECRET = 'test-webhook-secret';
 
 beforeAll(() => {
   process.env.MCP_ACCESS_KEY = VALID_KEY;
-  process.env.TASK_WEBHOOK_SECRET = VALID_SECRET;
-  process.env.SUPABASE_URL = 'https://test.supabase.co';
-  process.env.SUPABASE_SECRET_KEY = 'test-secret-key';
-  // Prevent startup sweep from running (no-op: SUPABASE_URL is set but require.main !== module)
 });
 
 afterAll(() => {
   delete process.env.MCP_ACCESS_KEY;
-  delete process.env.TASK_WEBHOOK_SECRET;
-  delete process.env.SUPABASE_URL;
-  delete process.env.SUPABASE_SECRET_KEY;
 });
 
 // Require app after env vars are configured
@@ -601,218 +592,5 @@ describe('GET /stats', () => {
       .set('x-brain-key', VALID_KEY);
 
     expect(res.status).toBe(500);
-  });
-});
-
-// ─── POST /webhooks/task-for-ai ───────────────────────────
-describe('POST /webhooks/task-for-ai', () => {
-  const validTask = {
-    id: 'task-1',
-    title: 'Do something',
-    description: 'Details',
-    priority: 'medium',
-    due_date: null,
-    working_dir: '/workspaces/project',
-    status: 'todo',
-  };
-
-  it('returns 401 when webhook secret is missing', async () => {
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .send({ type: 'INSERT', record: validTask });
-    expect(res.status).toBe(401);
-    expect(res.body.error).toMatch(/invalid webhook secret/i);
-  });
-
-  it('returns 401 when webhook secret is wrong', async () => {
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', 'wrong-secret')
-      .send({ type: 'INSERT', record: validTask });
-    expect(res.status).toBe(401);
-  });
-
-  it('ignores DELETE events', async () => {
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ type: 'DELETE', record: validTask });
-    expect(res.status).toBe(200);
-    expect(res.body.ignored).toMatch(/not an upsert/i);
-  });
-
-  it('ignores events with no record', async () => {
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ type: 'INSERT' });
-    expect(res.status).toBe(200);
-    expect(res.body.ignored).toBeDefined();
-  });
-
-  it('ignores tasks that are not in todo status', async () => {
-    const inProgressTask = { ...validTask, status: 'in_progress' };
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ type: 'INSERT', record: inProgressTask });
-    expect(res.status).toBe(200);
-    expect(res.body.ignored).toMatch(/not a todo task/i);
-  });
-
-  it('ignores done tasks', async () => {
-    const doneTask = { ...validTask, status: 'done' };
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ type: 'INSERT', record: doneTask });
-    expect(res.status).toBe(200);
-    expect(res.body.ignored).toMatch(/not a todo task/i);
-  });
-
-  it('ignores UPDATE events where old_record was already todo', async () => {
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ type: 'UPDATE', record: validTask, old_record: { status: 'todo' } });
-    expect(res.status).toBe(200);
-    expect(res.body.ignored).toMatch(/already active/i);
-  });
-
-  it('queues an INSERT with status todo', async () => {
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ type: 'INSERT', record: validTask });
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.queued).toBe('task-1');
-  });
-
-  it('queues an UPDATE that transitions from non-todo to todo', async () => {
-    const uniqueId = `task-update-${Date.now()}`;
-    const res = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({
-        type: 'UPDATE',
-        record: { ...validTask, id: uniqueId },
-        old_record: { status: 'done' },
-      });
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.queued).toBe(uniqueId);
-  });
-});
-
-// ─── POST /admin/dispatch-pending ────────────────────────
-describe('POST /admin/dispatch-pending', () => {
-  it('returns 401 when webhook secret is missing', async () => {
-    const res = await request(app).post('/admin/dispatch-pending').send({});
-    expect(res.status).toBe(401);
-  });
-
-  it('returns 401 when webhook secret is wrong', async () => {
-    const res = await request(app)
-      .post('/admin/dispatch-pending')
-      .set('x-webhook-secret', 'bad-secret')
-      .send({});
-    expect(res.status).toBe(401);
-  });
-
-  it('returns 200 with task counts when Supabase returns tasks', async () => {
-    const tasks = [
-      { id: 'p1', title: 'Task 1', description: null, priority: 'low', due_date: null, working_dir: '/a' },
-      { id: 'p2', title: 'Task 2', description: null, priority: 'high', due_date: null, working_dir: '/b' },
-    ];
-    global.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => tasks,
-    });
-
-    const res = await request(app)
-      .post('/admin/dispatch-pending')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({});
-
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(true);
-    expect(res.body.total).toBe(2);
-    expect(typeof res.body.queued).toBe('number');
-    expect(typeof res.body.skipped).toBe('number');
-  });
-
-  it('returns 200 when there are no pending tasks', async () => {
-    global.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => [],
-    });
-
-    const res = await request(app)
-      .post('/admin/dispatch-pending')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({});
-
-    expect(res.status).toBe(200);
-    expect(res.body.total).toBe(0);
-    expect(res.body.queued).toBe(0);
-  });
-
-  it('returns 502 when Supabase returns an error', async () => {
-    global.fetch.mockResolvedValue({
-      ok: false,
-      status: 503,
-      text: async () => 'service unavailable',
-    });
-
-    const res = await request(app)
-      .post('/admin/dispatch-pending')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({});
-
-    expect(res.status).toBe(502);
-    expect(res.body.error).toMatch(/failed to read tasks/i);
-  });
-
-  it('accepts optional project_id to scope the query', async () => {
-    global.fetch.mockResolvedValue({ ok: true, json: async () => [] });
-
-    await request(app)
-      .post('/admin/dispatch-pending')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send({ project_id: 'proj-abc' });
-
-    const fetchUrl = global.fetch.mock.calls[0][0];
-    expect(fetchUrl).toContain('proj-abc');
-  });
-});
-
-// ─── Task queue deduplication ─────────────────────────────
-describe('task queue deduplication', () => {
-  it('deduplicates concurrent webhook deliveries for the same task ID', async () => {
-    // Mock fetch so that tasks sent to dispatchTask don't fail loudly
-    global.fetch.mockResolvedValue({ ok: true, json: async () => ({}) });
-
-    const uniqueId = `dedup-${Date.now()}`;
-    const payload = {
-      type: 'INSERT',
-      record: { id: uniqueId, title: 'Dedup test', status: 'todo', working_dir: '/w' },
-    };
-
-    // First delivery: should queue
-    const res1 = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send(payload);
-    expect(res1.body.queued).toBe(uniqueId);
-
-    // Second delivery of the same task: should be ignored (in-flight)
-    const res2 = await request(app)
-      .post('/webhooks/task-for-ai')
-      .set('x-webhook-secret', VALID_SECRET)
-      .send(payload);
-    // The task is either still in-flight (ignored by enqueueTask) or already processed.
-    // Either way, the response should be ok and not error.
-    expect(res2.status).toBe(200);
   });
 });
