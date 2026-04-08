@@ -642,17 +642,31 @@ app.post("/admin/dispatch-pending", async (req, res) => {
 });
 
 // ─── Start ────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🧠 Open Brain server running at http://localhost:${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`🧠 Open Brain server running at http://localhost:${PORT}`);
+    console.log(`   Health check: http://localhost:${PORT}/health`);
 
-  // Sweep for any status=todo tasks that were sitting in the database while
-  // the dispatcher was down. The in-memory queue doesn't survive restarts,
-  // so without this any task created during downtime would wait until
-  // something else nudged its row.
-  if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
-    dispatchPendingTasks({ logTag: "startup" }).catch((err) => {
-      console.error(`[startup] failed to sweep pending tasks: ${err.message}`);
-    });
-  }
-});
+    // Sweep for any status=todo tasks that were sitting in the database while
+    // the dispatcher was down. The in-memory queue doesn't survive restarts,
+    // so without this any task created during downtime would wait until
+    // something else nudged its row.
+    if (SUPABASE_URL && SUPABASE_SECRET_KEY) {
+      dispatchPendingTasks({ logTag: "startup" }).catch((err) => {
+        console.error(`[startup] failed to sweep pending tasks: ${err.message}`);
+      });
+    }
+  });
+}
+
+// ─── Exports (used by tests) ──────────────────────────────
+module.exports = {
+  app,
+  translateWorkingDir,
+  buildPrompt,
+  verifyWorkPushed,
+  enqueueTask,
+  dispatchPendingTasks,
+  taskQueue,
+  inFlight,
+};

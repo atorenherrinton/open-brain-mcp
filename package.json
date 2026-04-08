@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "jest",
     "start": "node server.js",
     "start:mcp": "node mcp-server.js",
     "import:ged": "node scripts/import-ged-by-person.js",
@@ -27,5 +27,9 @@
     "express": "^5.2.1",
     "pg": "^8.19.0",
     "pgvector": "^0.2.1"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "supertest": "^7.2.2"
   }
 }
