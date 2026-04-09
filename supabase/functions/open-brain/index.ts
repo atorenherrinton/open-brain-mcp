@@ -561,6 +561,51 @@ function formatStats(stats: Record<string, unknown>) {
   return lines.join("\n");
 }
 
+function inferToolErrorCode(message: string) {
+  const lower = message.toLowerCase();
+  if (lower.includes("not found") || lower.startsWith("no ")) return "NOT_FOUND";
+  if (lower.includes("invalid") || lower.includes("required") || lower.includes("cannot be empty") || lower.includes("no fields to update")) return "VALIDATION_ERROR";
+  if (lower.includes("already exists") || lower.includes("duplicate") || lower.includes("conflict")) return "CONFLICT";
+  if (lower.includes("too many") || lower.includes("rate limit") || lower.includes("429")) return "RATE_LIMITED";
+  if (lower.includes("unauthorized") || lower.includes("forbidden") || lower.includes("access key") || lower.includes("expired token")) return "AUTH_ERROR";
+  if (lower.includes("missing")) return "CONFIG_ERROR";
+  return "INTERNAL_ERROR";
+}
+
+function normalizeToolResult(result: unknown) {
+  if (result && typeof result === "object" && "content" in result) {
+    const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
+    if (Array.isArray(content) && content.length === 1 && content[0]?.type === "text") {
+      const text = String(content[0].text ?? "");
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "ok" in parsed && "data" in parsed && "error" in parsed && "meta" in parsed) {
+          return result;
+        }
+      } catch {
+        // plain text result, wrap below
+      }
+      const code = inferToolErrorCode(text);
+      if (code === "NOT_FOUND") {
+        return jsonToolResult({ ok: false, data: null, error: { code, message: text }, meta: {} });
+      }
+      return jsonToolResult({ ok: true, data: { message: text }, error: null, meta: {} });
+    }
+    return result;
+  }
+  return jsonToolResult({ ok: true, data: result ?? null, error: null, meta: {} });
+}
+
+function normalizeToolError(error: unknown) {
+  if (error instanceof Response) {
+    const message = `HTTP ${error.status}`;
+    return { code: inferToolErrorCode(message), message };
+  }
+  const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+  return { code: inferToolErrorCode(message), message };
+}
+
+
 async function handleMcpRequest(req: Request, supabase: ReturnType<typeof createClient>) {
   const server = new McpServer(
     {
@@ -574,7 +619,72 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+
+  const registerTool = (name: string, config: Parameters<typeof server.registerTool>[1], handler: Parameters<typeof server.registerTool>[2]) =>
+    server.registerTool(name, config, async (args) => {
+      try {
+        return normalizeToolResult(await handler(args));
+      } catch (error) {
+        return jsonToolResult({ ok: false, data: null, error: normalizeToolError(error), meta: {} });
+      }
+    });
+
+  const resolveCallerIdentity = async () => {
+    const authHeader = req.headers.get("authorization");
+    if (authHeader?.startsWith("Bearer ")) {
+      const jwtSecret = Deno.env.get("OAUTH_JWT_SECRET") || Deno.env.get("OAUTH_CLIENT_SECRET") || "";
+      const payload = jwtSecret ? await verifyJWT(authHeader.slice(7), jwtSecret) : null;
+      return {
+        auth_method: "oauth_bearer",
+        subject: payload?.sub ?? null,
+        client_id: payload?.sub ?? null,
+        token_claims: payload ?? null,
+      };
+    }
+
+    const url = new URL(req.url);
+    const key = req.headers.get("x-brain-key") || url.searchParams.get("key");
+    if (key) {
+      return {
+        auth_method: "access_key",
+        key_present: true,
+      };
+    }
+
+    return {
+      auth_method: "anonymous",
+    };
+  };
+
+  registerTool(
+    "version",
+    {
+      description: "Return the Open Brain MCP server name and version.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => ({
+      name: "open-brain",
+      version: SERVER_VERSION,
+    })
+  );
+
+  registerTool(
+    "whoami",
+    {
+      description: "Return the caller identity and auth method currently seen by the MCP server.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      return {
+        auth: await resolveCallerIdentity(),
+        server: { name: "open-brain", version: SERVER_VERSION },
+      };
+    }
+  );
+
+  registerTool(
     "server_info",
     {
       description: "Get Open Brain MCP server version, capabilities, and supported enums.",
@@ -597,7 +707,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "health",
     {
       description: "Lightweight health check for Open Brain MCP and its backing database.",
@@ -637,7 +747,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "search_thoughts",
     {
       description: "Search captured thoughts by meaning.",
@@ -686,7 +796,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_thoughts",
     {
       description: "List recently captured thoughts with optional filters.",
@@ -711,7 +821,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "thought_stats",
     {
       description: "Get a summary of all captured thoughts.",
@@ -724,7 +834,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "capture_thought",
     {
       description: "Save a new thought to the Open Brain.",
@@ -736,7 +846,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "set_personal_info",
     {
       description: "Save or update a piece of personal information (name, birthday, preferences, etc.).",
@@ -761,7 +871,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "get_personal_info",
     {
       description: "Retrieve a specific piece of personal information by key.",
@@ -781,7 +891,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "search_personal_info",
     {
       description: "Search personal information by meaning. Use when the user asks about their details and you're not sure of the exact key.",
@@ -829,7 +939,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_personal_info",
     {
       description: "List all stored personal information, optionally filtered by category.",
@@ -857,7 +967,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "delete_personal_info",
     {
       description: "Delete a piece of personal information by key.",
@@ -874,7 +984,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
 
   // ── Project tools ──
 
-  server.registerTool(
+  registerTool(
     "get_project_bundle",
     {
       description: "Retrieve a project together with its tasks and recent notes in one call. Prefer this over chaining get_project + list_tasks when you need working context.",
@@ -892,10 +1002,10 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         .eq("id", project_id)
         .single();
       if (projectError) throw new Error(projectError.message);
-      if (!project) return { content: [{ type: "text", text: `No project found with ID "${project_id}".` }] };
+      if (!project) throw new Error(`No project found with ID "${project_id}".`);
 
       let taskQuery = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, working_dir, created_at, updated_at")
+        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at, updated_at")
         .eq("project_id", project_id);
       if (!include_done) taskQuery = taskQuery.neq("status", "done");
       taskQuery = taskQuery
@@ -920,42 +1030,19 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         notes = (noteRows ?? []) as Array<Record<string, unknown>>;
       }
 
-      const lines: string[] = [
-        `Project: ${project.name}`,
-        `Status: ${project.status}`,
-        `Created: ${project.created_at}`,
-        `Updated: ${project.updated_at}`,
-        `Project ID: ${project.id}`,
-      ];
-      if (project.description) lines.splice(2, 0, `Description: ${project.description}`);
-
-      lines.push("", `Tasks (${tasks?.length ?? 0}):`);
-      if (!tasks?.length) {
-        lines.push("  None.");
-      } else {
-        for (const task of tasks) {
-          lines.push(`  - [${task.status}] [${task.priority}] ${task.title} (${task.id})`);
-          if (task.due_date) lines.push(`    due: ${task.due_date}`);
-          if (task.working_dir) lines.push(`    working_dir: ${task.working_dir}`);
-          if (task.description) lines.push(`    ${task.description}`);
-        }
-      }
-
-      lines.push("", `Recent notes (${notes.length}):`);
-      if (!notes.length) {
-        lines.push("  None.");
-      } else {
-        for (const note of notes) {
-          lines.push(`  - [${String(note.type)}] task ${String(note.task_id)} @ ${String(note.created_at)}`);
-          lines.push(`    ${String(note.content)}`);
-        }
-      }
-
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      return {
+        project,
+        tasks: tasks ?? [],
+        recent_notes: notes,
+        summary: {
+          active_task_count: (tasks ?? []).length,
+          recent_note_count: notes.length,
+        },
+      };
     }
   );
 
-  server.registerTool(
+  registerTool(
     "create_project",
     {
       description: "Create a new project. Projects group related tasks together.",
@@ -976,7 +1063,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "get_project",
     {
       description: "Retrieve a specific project by its ID.",
@@ -1006,7 +1093,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "update_project",
     {
       description: "Update a project's name, description, or status. Set status to 'archived' to archive a project.",
@@ -1035,7 +1122,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_projects",
     {
       description: "List projects with optional status filter.",
@@ -1065,7 +1152,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "search_projects",
     {
       description: "Search projects by name or description.",
@@ -1098,7 +1185,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
 
   // ── Task tools ──
 
-  server.registerTool(
+  registerTool(
     "create_task",
     {
       description: "Create a new task. Use this when the user wants to track something they need to do. The daily dispatcher will pick it up and a Claude Code agent will either do it or skip it if it isn't suitable code work. Optionally assign to a project.",
@@ -1131,7 +1218,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "get_task",
     {
       description: "Retrieve a specific task by its ID.",
@@ -1173,7 +1260,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "get_task_bundle",
     {
       description: "Retrieve a task together with its project and recent notes in one call. Prefer this when you need execution context for an agent.",
@@ -1189,7 +1276,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         .eq("id", task_id)
         .single();
       if (taskError) throw new Error(taskError.message);
-      if (!task) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
+      if (!task) throw new Error(`No task found with ID "${task_id}".`);
 
       const [projectResult, notesResult] = await Promise.all([
         task.project_id
@@ -1208,43 +1295,18 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (projectResult.error) throw new Error(projectResult.error.message);
       if (notesResult.error) throw new Error(notesResult.error.message);
 
-      const lines = [
-        `Task: ${task.title}`,
-        `Status: ${task.status}`,
-        `Priority: ${task.priority}`,
-        `Working dir: ${task.working_dir}`,
-      ];
-      if (task.description) lines.push(`Description: ${task.description}`);
-      if (task.due_date) lines.push(`Due: ${task.due_date}`);
-      lines.push(`Created: ${task.created_at}`);
-      lines.push(`Updated: ${task.updated_at}`);
-      lines.push(`Task ID: ${task.id}`);
-
-      if (projectResult.data) {
-        lines.push(
-          "",
-          "Project:",
-          `  ${projectResult.data.name} [${projectResult.data.status}] (${projectResult.data.id})`,
-        );
-        if (projectResult.data.description) lines.push(`  ${projectResult.data.description}`);
-      }
-
-      const notes = notesResult.data ?? [];
-      lines.push("", `Recent notes (${notes.length}):`);
-      if (!notes.length) {
-        lines.push("  None.");
-      } else {
-        for (const note of notes) {
-          lines.push(`  - [${note.type}] ${note.created_at} (${note.id})`);
-          lines.push(`    ${note.content}`);
-        }
-      }
-
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      return {
+        task,
+        project: projectResult.data ?? null,
+        notes: notesResult.data ?? [],
+        summary: {
+          note_count: (notesResult.data ?? []).length,
+        },
+      };
     }
   );
 
-  server.registerTool(
+  registerTool(
     "update_task",
     {
       description: "Update a task's title, description, status, priority, due date, or project. To mark a task as done, set status to 'done'. Setting status back to 'todo' makes the task eligible for the next daily dispatcher run.",
@@ -1284,7 +1346,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_tasks",
     {
       description: "List tasks with optional filters by status, priority, project, or due date.",
@@ -1328,7 +1390,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "search_tasks",
     {
       description: "Search tasks by title, description, status, or priority.",
@@ -1363,7 +1425,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
 
   // ─── Task Notes ──────────────────────────────────────────────────────
 
-  server.registerTool(
+  registerTool(
     "add_task_note",
     {
       description: "Add a note or deliverable to a task. Use type 'note' for general notes and 'deliverable' for specific outputs/artifacts.",
@@ -1385,7 +1447,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "list_task_notes",
     {
       description: "List all notes and deliverables for a specific task.",
@@ -1417,7 +1479,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "update_task_note",
     {
       description: "Update the content or type of an existing task note.",
@@ -1440,7 +1502,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "delete_task_note",
     {
       description: "Delete a task note by its ID.",
@@ -1455,7 +1517,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "search_task_notes",
     {
       description: "Search task notes by content or type. Optionally scope to a specific task.",
@@ -1486,7 +1548,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "connect_info_to_thoughts",
     {
       description: "Find thoughts related to a piece of personal info. Great for brainstorming — e.g. connect your resume, goals, or skills to captured thoughts.",
@@ -1534,7 +1596,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
-  server.registerTool(
+  registerTool(
     "connect_thought_to_info",
     {
       description: "Find personal info related to a thought. Use a thought ID or a search query to find which personal details connect to a captured thought.",
