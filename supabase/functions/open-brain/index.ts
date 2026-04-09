@@ -998,7 +998,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ project_id, include_done, task_limit, note_limit }) => {
       const { data: project, error: projectError } = await supabase.from("projects")
-        .select("id, name, description, status, created_at, updated_at")
+        .select("id, name, description, repo_url, status, created_at, updated_at")
         .eq("id", project_id)
         .single();
       if (projectError) throw new Error(projectError.message);
@@ -1045,19 +1045,22 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   registerTool(
     "create_project",
     {
-      description: "Create a new project. Projects group related tasks together.",
+      description: "Create a new project. Projects group related tasks together and can include a repo URL.",
       inputSchema: z.object({
         name: z.string(),
         description: z.string().optional(),
+        repo_url: z.string().optional(),
       }),
     },
-    async ({ name, description }) => {
+    async ({ name, description, repo_url }) => {
       const { data, error } = await supabase.from("projects").insert({
         name: name.trim(),
         description: description?.trim() || null,
-      }).select("id, name, status").single();
+        repo_url: repo_url?.trim() || null,
+      }).select("id, name, repo_url, status").single();
       if (error) throw new Error(error.message);
       let confirmation = `Created project: "${data.name}" [${data.status}]`;
+      if (data.repo_url) confirmation += `\nRepo: ${data.repo_url}`;
       confirmation += `\nID: ${data.id}`;
       return { content: [{ type: "text", text: confirmation }] };
     }
@@ -1072,7 +1075,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ project_id }) => {
       const { data, error } = await supabase.from("projects")
-        .select("id, name, description, status, created_at, updated_at")
+        .select("id, name, description, repo_url, status, created_at, updated_at")
         .eq("id", project_id).single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No project found with ID "${project_id}".` }] };
@@ -1085,6 +1088,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         `Status: ${data.status}`,
       ];
       if (data.description) lines.push(`Description: ${data.description}`);
+      if (data.repo_url) lines.push(`Repo: ${data.repo_url}`);
       lines.push(`Tasks: ${count ?? 0}`);
       lines.push(`Created: ${new Date(data.created_at).toLocaleDateString()}`);
       lines.push(`Updated: ${new Date(data.updated_at).toLocaleDateString()}`);
@@ -1096,18 +1100,20 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   registerTool(
     "update_project",
     {
-      description: "Update a project's name, description, or status. Set status to 'archived' to archive a project.",
+      description: "Update a project's name, description, repo URL, or status. Set status to 'archived' to archive a project.",
       inputSchema: z.object({
         project_id: z.string(),
         name: z.string().optional(),
         description: z.string().optional(),
+        repo_url: z.string().optional(),
         status: z.enum(PROJECT_STATUSES).optional(),
       }),
     },
-    async ({ project_id, name, description, status }) => {
+    async ({ project_id, name, description, repo_url, status }) => {
       const updates: Record<string, unknown> = {};
       if (name !== undefined) updates.name = name.trim();
       if (description !== undefined) updates.description = description?.trim() || null;
+      if (repo_url !== undefined) updates.repo_url = repo_url?.trim() || null;
       if (status !== undefined) {
         const s = status.toLowerCase().trim();
         updates.status = s;
@@ -1115,10 +1121,12 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
 
       const { data, error } = await supabase.from("projects").update(updates).eq("id", project_id)
-        .select("id, name, status").single();
+        .select("id, name, repo_url, status").single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No project found with ID "${project_id}".` }] };
-      return { content: [{ type: "text", text: `Updated project: "${data.name}" [${data.status}]` }] };
+      let message = `Updated project: "${data.name}" [${data.status}]`;
+      if (data.repo_url) message += `\nRepo: ${data.repo_url}`;
+      return { content: [{ type: "text", text: message }] };
     }
   );
 
@@ -1136,7 +1144,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ include_archived, updated_since, limit }) => {
       let query = supabase.from("projects")
-        .select("id, name, description, status, created_at, updated_at");
+        .select("id, name, description, repo_url, status, created_at, updated_at");
       if (!include_archived) query = query.eq("status", "active");
       if (updated_since) query = query.gte("updated_at", updated_since);
       query = query.order("updated_at", { ascending: false }).limit(limit ?? 20);
@@ -1146,6 +1154,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       const text = data.map((p: Record<string, unknown>, i: number) => {
         const parts = [`${i + 1}. [${p.status}] ${p.name}`];
         if (p.description) parts.push(`   ${p.description}`);
+        if (p.repo_url) parts.push(`   Repo: ${p.repo_url}`);
         parts.push(`   ID: ${p.id}`);
         return parts.join("\n");
       }).join("\n\n");
@@ -1156,7 +1165,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   registerTool(
     "search_projects",
     {
-      description: "Search projects by name or description.",
+      description: "Search projects by name, description, or repo URL.",
       inputSchema: z.object({
         query: z.string(),
         include_archived: z.boolean().optional(),
@@ -1167,8 +1176,8 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     async ({ query, include_archived, limit }) => {
       const pattern = `%${query}%`;
       let q = supabase.from("projects")
-        .select("id, name, description, status, created_at")
-        .or(`name.ilike.${pattern},description.ilike.${pattern}`);
+        .select("id, name, description, repo_url, status, created_at")
+        .or(`name.ilike.${pattern},description.ilike.${pattern},repo_url.ilike.${pattern}`);
       if (!include_archived) q = q.eq("status", "active");
       q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
       const { data, error } = await q;
@@ -1177,6 +1186,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       const text = data.map((p: Record<string, unknown>, i: number) => {
         const parts = [`${i + 1}. [${p.status}] ${p.name}`];
         if (p.description) parts.push(`   ${p.description}`);
+        if (p.repo_url) parts.push(`   Repo: ${p.repo_url}`);
         parts.push(`   ID: ${p.id}`);
         return parts.join("\n");
       }).join("\n\n");
@@ -1282,7 +1292,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       const [projectResult, notesResult] = await Promise.all([
         task.project_id
           ? supabase.from("projects")
-            .select("id, name, description, status, updated_at")
+            .select("id, name, description, repo_url, status, updated_at")
             .eq("id", task.project_id)
             .single()
           : Promise.resolve({ data: null, error: null }),
