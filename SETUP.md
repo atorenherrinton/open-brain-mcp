@@ -139,7 +139,7 @@ If you want a local Claude agent to wake up once a day and grind through your ta
 
 ### How it works
 
-`scripts/daily-dispatch.sh` invokes `claude --print` headlessly with a prompt that walks `list_tasks` (todo + in_progress) via the Open Brain MCP, cd's into each task's `working_dir`, does the work, commits, pushes, verifies the push, and updates the task status. Skips tasks without a valid `working_dir`.
+`scripts/daily-dispatch.sh` invokes `claude --print` headlessly with a prompt that walks `list_tasks` (todo + in_progress) via the Open Brain MCP, infers the right repo under `~/Documents/GitHub` from each task's content (and project, if any), does the work, commits, pushes, verifies the push, and updates the task status. Skips tasks where the target repo can't be identified unambiguously.
 
 ### 1. Install the script
 

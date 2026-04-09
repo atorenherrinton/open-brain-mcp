@@ -36,11 +36,14 @@ Procedure:
    Sort by priority then due_date. Process them one at a time.
 
 2. For each task:
-   a. If the task has no working_dir, or the working_dir does not exist on
-      disk, SKIP it. Add a task note explaining why and move on. Do NOT
-      guess a directory.
-   b. cd into the task's working_dir.
-   c. Read the task title + description carefully. Do the work.
+   a. Read the task title + description carefully. Figure out which repo
+      under ~/Documents/GitHub the task is about. If the task has a
+      project_id, call get_project to see if the project name/description
+      points at a specific repo. If you cannot confidently identify a
+      single repo from the task content, SKIP the task: add a task note
+      explaining the ambiguity and move on. Do NOT guess.
+   b. cd into that repo.
+   c. Do the work.
    d. Commit your changes with a clear message.
    e. Push to the remote.
    f. VERIFY the push landed: run `git rev-parse HEAD` and

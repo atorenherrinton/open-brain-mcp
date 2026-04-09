@@ -1024,24 +1024,19 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "create_task",
     {
-      description: "Create a new task. Use this when the user wants to track something they need to do. Every task is auto-dispatched to a Claude Code agent in the given working_dir; the agent will look at the task and either do it or skip it if it isn't suitable code work. Optionally assign to a project.",
+      description: "Create a new task. Use this when the user wants to track something they need to do. The daily dispatcher will pick it up and a Claude Code agent will either do it or skip it if it isn't suitable code work. Optionally assign to a project.",
       inputSchema: z.object({
         title: z.string(),
         description: z.string().optional(),
         priority: z.enum(TASK_PRIORITIES).optional(),
         due_date: z.string().optional(),
         project_id: z.string().optional(),
-        working_dir: z.string(),
       }),
     },
-    async ({ title, description, priority, due_date, project_id, working_dir }) => {
+    async ({ title, description, priority, due_date, project_id }) => {
       const normalizedPriority = (priority || "medium").toLowerCase().trim();
       if (!TASK_PRIORITIES.includes(normalizedPriority as typeof TASK_PRIORITIES[number])) {
         throw new Error(`Invalid priority "${priority}". Must be: ${TASK_PRIORITIES.join(", ")}`);
-      }
-      const trimmedWorkingDir = working_dir?.trim();
-      if (!trimmedWorkingDir) {
-        throw new Error("working_dir is required (absolute host path where Claude Code should run).");
       }
       const { data, error } = await supabase.from("tasks").insert({
         title: title.trim(),
@@ -1049,13 +1044,11 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         priority: normalizedPriority,
         due_date: due_date || null,
         project_id: project_id || null,
-        working_dir: trimmedWorkingDir,
-      }).select("id, title, status, priority, due_date, project_id, working_dir").single();
+      }).select("id, title, status, priority, due_date, project_id").single();
       if (error) throw new Error(error.message);
       let confirmation = `Created task: "${data.title}" [${data.priority}]`;
       if (data.due_date) confirmation += ` — due ${data.due_date}`;
       if (data.project_id) confirmation += ` — project ${data.project_id}`;
-      confirmation += `\nWorking dir: ${data.working_dir}`;
       confirmation += `\nID: ${data.id}`;
       return { content: [{ type: "text", text: confirmation }] };
     }
@@ -1070,7 +1063,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ task_id }) => {
       const { data, error } = await supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at, updated_at")
+        .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at")
         .eq("id", task_id).single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
@@ -1078,7 +1071,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         `Title: ${data.title}`,
         `Status: ${data.status}`,
         `Priority: ${data.priority}`,
-        `Working dir: ${data.working_dir}`,
       ];
       if (data.description) lines.push(`Description: ${data.description}`);
       if (data.due_date) lines.push(`Due: ${data.due_date}`);
@@ -1178,7 +1170,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   server.registerTool(
     "update_task",
     {
-      description: "Update a task's title, description, status, priority, due date, project, or working_dir. To mark a task as done, set status to 'done'. Setting status back to 'todo' will redispatch the task to the AI agent.",
+      description: "Update a task's title, description, status, priority, due date, or project. To mark a task as done, set status to 'done'. Setting status back to 'todo' makes the task eligible for the next daily dispatcher run.",
       inputSchema: z.object({
         task_id: z.string(),
         title: z.string().optional(),
@@ -1187,10 +1179,9 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         priority: z.enum(TASK_PRIORITIES).optional(),
         due_date: z.string().optional(),
         project_id: z.string().optional(),
-        working_dir: z.string().optional(),
       }),
     },
-    async ({ task_id, title, description, status, priority, due_date, project_id, working_dir }) => {
+    async ({ task_id, title, description, status, priority, due_date, project_id }) => {
       const updates: Record<string, unknown> = {};
       if (title !== undefined) updates.title = title.trim();
       if (description !== undefined) updates.description = description?.trim() || null;
@@ -1204,20 +1195,14 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }
       if (due_date !== undefined) updates.due_date = due_date || null;
       if (project_id !== undefined) updates.project_id = project_id || null;
-      if (working_dir !== undefined) {
-        const wd = working_dir?.trim();
-        if (!wd) throw new Error("working_dir cannot be empty.");
-        updates.working_dir = wd;
-      }
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
 
       const { data, error } = await supabase.from("tasks").update(updates).eq("id", task_id)
-        .select("id, title, status, priority, due_date, working_dir").single();
+        .select("id, title, status, priority, due_date").single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
       let confirmation = `Updated: "${data.title}" [${data.status}, ${data.priority}]`;
       if (data.due_date) confirmation += ` — due ${data.due_date}`;
-      confirmation += `\nWorking dir: ${data.working_dir}`;
       return { content: [{ type: "text", text: confirmation }] };
     }
   );
@@ -1237,7 +1222,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ status, priority, project_id, include_done, limit }) => {
       let query = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at");
+        .select("id, title, description, status, priority, due_date, project_id, created_at");
       if (status) {
         query = query.eq("status", status.toLowerCase().trim());
       } else if (!include_done) {
@@ -1257,7 +1242,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
         if (t.project_id) parts.push(`   Project: ${t.project_id}`);
-        parts.push(`   Working dir: ${t.working_dir}`);
         parts.push(`   ID: ${t.id}`);
         return parts.join("\n");
       }).join("\n\n");
@@ -1279,7 +1263,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     async ({ query, include_done, limit }) => {
       const pattern = `%${query}%`;
       let q = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at")
+        .select("id, title, description, status, priority, due_date, project_id, created_at")
         .or(`title.ilike.${pattern},description.ilike.${pattern},status.ilike.${pattern},priority.ilike.${pattern}`);
       if (!include_done) q = q.neq("status", "done");
       q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
@@ -1291,7 +1275,6 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         if (t.due_date) parts[0] += ` — due ${t.due_date}`;
         if (t.description) parts.push(`   ${t.description}`);
         if (t.project_id) parts.push(`   Project: ${t.project_id}`);
-        parts.push(`   Working dir: ${t.working_dir}`);
         parts.push(`   ID: ${t.id}`);
         return parts.join("\n");
       }).join("\n\n");
