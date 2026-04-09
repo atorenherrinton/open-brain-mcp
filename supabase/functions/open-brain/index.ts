@@ -5,6 +5,11 @@ import { z } from "npm:zod@3.24.1";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
+const SERVER_VERSION = "1.1.0";
+const PROJECT_STATUSES = ["active", "archived"] as const;
+const TASK_STATUSES = ["todo", "in_progress", "done"] as const;
+const TASK_PRIORITIES = ["low", "medium", "high"] as const;
+const TASK_NOTE_TYPES = ["note", "deliverable"] as const;
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -536,12 +541,75 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   const server = new McpServer(
     {
       name: "open-brain",
-      version: "1.0.0",
+      version: SERVER_VERSION,
     },
     {
       capabilities: {
         tools: {},
       },
+    }
+  );
+
+  server.registerTool(
+    "server_info",
+    {
+      description: "Get Open Brain MCP server version, capabilities, and supported enums.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const info = {
+        name: "open-brain",
+        version: SERVER_VERSION,
+        supported: {
+          project_statuses: PROJECT_STATUSES,
+          task_statuses: TASK_STATUSES,
+          task_priorities: TASK_PRIORITIES,
+          task_note_types: TASK_NOTE_TYPES,
+        },
+        bundle_tools: ["get_task_bundle", "get_project_bundle"],
+      };
+      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "health",
+    {
+      description: "Lightweight health check for Open Brain MCP and its backing database.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const [thoughts, personalInfo, projects, tasks, taskNotes] = await Promise.all([
+        supabase.from("thoughts").select("id", { count: "exact", head: true }),
+        supabase.from("personal_info").select("id", { count: "exact", head: true }),
+        supabase.from("projects").select("id", { count: "exact", head: true }),
+        supabase.from("tasks").select("id", { count: "exact", head: true }),
+        supabase.from("task_notes").select("id", { count: "exact", head: true }),
+      ]);
+
+      const errors = [thoughts, personalInfo, projects, tasks, taskNotes]
+        .map((result) => result.error?.message)
+        .filter(Boolean);
+      if (errors.length) {
+        throw new Error(`Health check failed: ${errors.join("; ")}`);
+      }
+
+      const payload = {
+        ok: true,
+        name: "open-brain",
+        version: SERVER_VERSION,
+        checked_at: new Date().toISOString(),
+        counts: {
+          thoughts: thoughts.count ?? 0,
+          personal_info: personalInfo.count ?? 0,
+          projects: projects.count ?? 0,
+          tasks: tasks.count ?? 0,
+          task_notes: taskNotes.count ?? 0,
+        },
+      };
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
     }
   );
 
@@ -732,6 +800,87 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   // ── Project tools ──
 
   server.registerTool(
+    "get_project_bundle",
+    {
+      description: "Retrieve a project together with its tasks and recent notes in one call. Prefer this over chaining get_project + list_tasks when you need working context.",
+      inputSchema: z.object({
+        project_id: z.string(),
+        include_done: z.boolean().optional(),
+        task_limit: z.number().optional(),
+        note_limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ project_id, include_done, task_limit, note_limit }) => {
+      const { data: project, error: projectError } = await supabase.from("projects")
+        .select("id, name, description, status, created_at, updated_at")
+        .eq("id", project_id)
+        .single();
+      if (projectError) throw new Error(projectError.message);
+      if (!project) return { content: [{ type: "text", text: `No project found with ID "${project_id}".` }] };
+
+      let taskQuery = supabase.from("tasks")
+        .select("id, title, description, status, priority, due_date, working_dir, created_at, updated_at")
+        .eq("project_id", project_id);
+      if (!include_done) taskQuery = taskQuery.neq("status", "done");
+      taskQuery = taskQuery
+        .order("status", { ascending: true })
+        .order("priority", { ascending: true })
+        .order("due_date", { ascending: true, nullsFirst: false })
+        .order("created_at", { ascending: false })
+        .limit(task_limit ?? 25);
+
+      const { data: tasks, error: tasksError } = await taskQuery;
+      if (tasksError) throw new Error(tasksError.message);
+
+      const taskIds = (tasks ?? []).map((task) => task.id);
+      let notes: Array<Record<string, unknown>> = [];
+      if (taskIds.length) {
+        const { data: noteRows, error: noteError } = await supabase.from("task_notes")
+          .select("id, task_id, type, content, created_at, updated_at")
+          .in("task_id", taskIds)
+          .order("created_at", { ascending: false })
+          .limit(note_limit ?? 15);
+        if (noteError) throw new Error(noteError.message);
+        notes = (noteRows ?? []) as Array<Record<string, unknown>>;
+      }
+
+      const lines: string[] = [
+        `Project: ${project.name}`,
+        `Status: ${project.status}`,
+        `Created: ${project.created_at}`,
+        `Updated: ${project.updated_at}`,
+        `Project ID: ${project.id}`,
+      ];
+      if (project.description) lines.splice(2, 0, `Description: ${project.description}`);
+
+      lines.push("", `Tasks (${tasks?.length ?? 0}):`);
+      if (!tasks?.length) {
+        lines.push("  None.");
+      } else {
+        for (const task of tasks) {
+          lines.push(`  - [${task.status}] [${task.priority}] ${task.title} (${task.id})`);
+          if (task.due_date) lines.push(`    due: ${task.due_date}`);
+          if (task.working_dir) lines.push(`    working_dir: ${task.working_dir}`);
+          if (task.description) lines.push(`    ${task.description}`);
+        }
+      }
+
+      lines.push("", `Recent notes (${notes.length}):`);
+      if (!notes.length) {
+        lines.push("  None.");
+      } else {
+        for (const note of notes) {
+          lines.push(`  - [${String(note.type)}] task ${String(note.task_id)} @ ${String(note.created_at)}`);
+          lines.push(`    ${String(note.content)}`);
+        }
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.registerTool(
     "create_project",
     {
       description: "Create a new project. Projects group related tasks together.",
@@ -790,7 +939,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         project_id: z.string(),
         name: z.string().optional(),
         description: z.string().optional(),
-        status: z.string().optional(),
+        status: z.enum(PROJECT_STATUSES).optional(),
       }),
     },
     async ({ project_id, name, description, status }) => {
@@ -798,9 +947,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (name !== undefined) updates.name = name.trim();
       if (description !== undefined) updates.description = description?.trim() || null;
       if (status !== undefined) {
-        const validStatuses = ["active", "archived"];
         const s = status.toLowerCase().trim();
-        if (!validStatuses.includes(s)) throw new Error(`Invalid status "${status}". Must be: ${validStatuses.join(", ")}`);
         updates.status = s;
       }
       if (!Object.keys(updates).length) throw new Error("No fields to update.");
@@ -881,7 +1028,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       inputSchema: z.object({
         title: z.string(),
         description: z.string().optional(),
-        priority: z.string().optional(),
+        priority: z.enum(TASK_PRIORITIES).optional(),
         due_date: z.string().optional(),
         project_id: z.string().optional(),
         working_dir: z.string(),
@@ -889,9 +1036,8 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ title, description, priority, due_date, project_id, working_dir }) => {
       const normalizedPriority = (priority || "medium").toLowerCase().trim();
-      const validPriorities = ["low", "medium", "high"];
-      if (!validPriorities.includes(normalizedPriority)) {
-        throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
+      if (!TASK_PRIORITIES.includes(normalizedPriority as typeof TASK_PRIORITIES[number])) {
+        throw new Error(`Invalid priority "${priority}". Must be: ${TASK_PRIORITIES.join(", ")}`);
       }
       const trimmedWorkingDir = working_dir?.trim();
       if (!trimmedWorkingDir) {
@@ -959,6 +1105,77 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   );
 
   server.registerTool(
+    "get_task_bundle",
+    {
+      description: "Retrieve a task together with its project and recent notes in one call. Prefer this when you need execution context for an agent.",
+      inputSchema: z.object({
+        task_id: z.string(),
+        note_limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ task_id, note_limit }) => {
+      const { data: task, error: taskError } = await supabase.from("tasks")
+        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at, updated_at")
+        .eq("id", task_id)
+        .single();
+      if (taskError) throw new Error(taskError.message);
+      if (!task) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
+
+      const [projectResult, notesResult] = await Promise.all([
+        task.project_id
+          ? supabase.from("projects")
+            .select("id, name, description, status, updated_at")
+            .eq("id", task.project_id)
+            .single()
+          : Promise.resolve({ data: null, error: null }),
+        supabase.from("task_notes")
+          .select("id, content, type, created_at, updated_at")
+          .eq("task_id", task_id)
+          .order("created_at", { ascending: false })
+          .limit(note_limit ?? 10),
+      ]);
+
+      if (projectResult.error) throw new Error(projectResult.error.message);
+      if (notesResult.error) throw new Error(notesResult.error.message);
+
+      const lines = [
+        `Task: ${task.title}`,
+        `Status: ${task.status}`,
+        `Priority: ${task.priority}`,
+        `Working dir: ${task.working_dir}`,
+      ];
+      if (task.description) lines.push(`Description: ${task.description}`);
+      if (task.due_date) lines.push(`Due: ${task.due_date}`);
+      lines.push(`Created: ${task.created_at}`);
+      lines.push(`Updated: ${task.updated_at}`);
+      lines.push(`Task ID: ${task.id}`);
+
+      if (projectResult.data) {
+        lines.push(
+          "",
+          "Project:",
+          `  ${projectResult.data.name} [${projectResult.data.status}] (${projectResult.data.id})`,
+        );
+        if (projectResult.data.description) lines.push(`  ${projectResult.data.description}`);
+      }
+
+      const notes = notesResult.data ?? [];
+      lines.push("", `Recent notes (${notes.length}):`);
+      if (!notes.length) {
+        lines.push("  None.");
+      } else {
+        for (const note of notes) {
+          lines.push(`  - [${note.type}] ${note.created_at} (${note.id})`);
+          lines.push(`    ${note.content}`);
+        }
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.registerTool(
     "update_task",
     {
       description: "Update a task's title, description, status, priority, due date, project, or working_dir. To mark a task as done, set status to 'done'. Setting status back to 'todo' will redispatch the task to the AI agent.",
@@ -966,8 +1183,8 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         task_id: z.string(),
         title: z.string().optional(),
         description: z.string().optional(),
-        status: z.string().optional(),
-        priority: z.string().optional(),
+        status: z.enum(TASK_STATUSES).optional(),
+        priority: z.enum(TASK_PRIORITIES).optional(),
         due_date: z.string().optional(),
         project_id: z.string().optional(),
         working_dir: z.string().optional(),
@@ -978,15 +1195,11 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (title !== undefined) updates.title = title.trim();
       if (description !== undefined) updates.description = description?.trim() || null;
       if (status !== undefined) {
-        const validStatuses = ["todo", "in_progress", "done"];
         const s = status.toLowerCase().trim();
-        if (!validStatuses.includes(s)) throw new Error(`Invalid status "${status}". Must be: ${validStatuses.join(", ")}`);
         updates.status = s;
       }
       if (priority !== undefined) {
-        const validPriorities = ["low", "medium", "high"];
         const p = priority.toLowerCase().trim();
-        if (!validPriorities.includes(p)) throw new Error(`Invalid priority "${priority}". Must be: ${validPriorities.join(", ")}`);
         updates.priority = p;
       }
       if (due_date !== undefined) updates.due_date = due_date || null;
@@ -1014,8 +1227,8 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     {
       description: "List tasks with optional filters by status, priority, project, or due date.",
       inputSchema: z.object({
-        status: z.string().optional(),
-        priority: z.string().optional(),
+        status: z.enum(TASK_STATUSES).optional(),
+        priority: z.enum(TASK_PRIORITIES).optional(),
         project_id: z.string().optional(),
         include_done: z.boolean().optional(),
         limit: z.number().optional(),
@@ -1095,7 +1308,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       inputSchema: z.object({
         task_id: z.string(),
         content: z.string(),
-        type: z.string().optional(),
+        type: z.enum(TASK_NOTE_TYPES).optional(),
       }),
     },
     async ({ task_id, content, type }) => {
@@ -1116,7 +1329,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       description: "List all notes and deliverables for a specific task.",
       inputSchema: z.object({
         task_id: z.string(),
-        type: z.string().optional(),
+        type: z.enum(TASK_NOTE_TYPES).optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
@@ -1147,7 +1360,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       inputSchema: z.object({
         note_id: z.string(),
         content: z.string().optional(),
-        type: z.string().optional(),
+        type: z.enum(TASK_NOTE_TYPES).optional(),
       }),
     },
     async ({ note_id, content, type }) => {
