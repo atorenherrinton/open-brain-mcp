@@ -1129,6 +1129,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       inputSchema: z.object({
         include_archived: z.boolean().optional(),
         updated_since: z.string().optional(),
+        cursor: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
@@ -1356,6 +1357,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         project_id: z.string().optional(),
         include_done: z.boolean().optional(),
         updated_since: z.string().optional(),
+        cursor: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
@@ -1455,6 +1457,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         task_id: z.string(),
         type: z.enum(TASK_NOTE_TYPES).optional(),
         updated_since: z.string().optional(),
+        cursor: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
