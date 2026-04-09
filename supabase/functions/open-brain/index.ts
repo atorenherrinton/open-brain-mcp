@@ -49,6 +49,30 @@ function normalizeContent(content: unknown) {
     .replace(/\s+/g, " ");
 }
 
+function jsonToolResult(payload: Record<string, unknown>) {
+  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+}
+
+function makeSnippet(value: unknown, max = 180) {
+  const text = normalizeContent(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
+}
+
+function collectMatchedFields(query: string, candidates: Record<string, unknown>) {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const matched: string[] = [];
+  for (const [field, value] of Object.entries(candidates)) {
+    const haystack = Array.isArray(value)
+      ? value.map((entry) => String(entry).toLowerCase()).join(" ")
+      : String(value ?? "").toLowerCase();
+    if (tokens.some((token) => haystack.includes(token))) {
+      matched.push(field);
+    }
+  }
+  return matched.length ? matched : ["semantic_match"];
+}
+
 async function getEmbedding(text: string) {
   const res = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
@@ -569,7 +593,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         },
         bundle_tools: ["get_task_bundle", "get_project_bundle"],
       };
-      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      return jsonToolResult({ ok: true, data: info, error: null, meta: {} });
     }
   );
 
@@ -609,7 +633,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
           task_notes: taskNotes.count ?? 0,
         },
       };
-      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+      return jsonToolResult({ ok: true, data: payload, error: null, meta: {} });
     }
   );
 
@@ -625,8 +649,40 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       annotations: { readOnlyHint: true },
     },
     async ({ query, limit, threshold }) => {
-      const results = await searchThoughts(supabase, query, limit ?? 10, threshold ?? 0.5);
-      return { content: [{ type: "text", text: formatSearchResults(results as Array<Record<string, unknown>>, query) }] };
+      const effectiveLimit = limit ?? 10;
+      const effectiveThreshold = threshold ?? 0.5;
+      const results = await searchThoughts(supabase, query, effectiveLimit, effectiveThreshold);
+      const items = (results as Array<Record<string, unknown>>).map((result) => {
+        const metadata = (result.metadata as Record<string, unknown> | null) ?? {};
+        return {
+          id: result.id,
+          content: result.content,
+          snippet: makeSnippet(result.content),
+          created_at: result.created_at,
+          type: metadata.type ?? null,
+          topics: Array.isArray(metadata.topics) ? metadata.topics : [],
+          people: Array.isArray(metadata.people) ? metadata.people : [],
+          action_items: Array.isArray(metadata.action_items) ? metadata.action_items : [],
+          score: Number(result.similarity ?? 0),
+          matched_fields: collectMatchedFields(query, {
+            content: result.content,
+            topics: Array.isArray(metadata.topics) ? metadata.topics : [],
+            people: Array.isArray(metadata.people) ? metadata.people : [],
+            action_items: Array.isArray(metadata.action_items) ? metadata.action_items : [],
+          }),
+        };
+      });
+      return jsonToolResult({
+        ok: true,
+        data: { results: items },
+        error: null,
+        meta: {
+          query,
+          limit: effectiveLimit,
+          threshold: effectiveThreshold,
+          result_count: items.length,
+        },
+      });
     }
   );
 
@@ -737,20 +793,39 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       annotations: { readOnlyHint: true },
     },
     async ({ query, limit, threshold }) => {
+      const effectiveLimit = limit ?? 10;
+      const effectiveThreshold = threshold ?? 0.5;
       const embedding = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_personal_info", {
         query_embedding: vectorLiteral(embedding),
-        match_threshold: threshold ?? 0.5,
-        match_count: limit ?? 10,
+        match_threshold: effectiveThreshold,
+        match_count: effectiveLimit,
       });
       if (error) throw new Error(error.message);
-      if (!data || !data.length) {
-        return { content: [{ type: "text", text: `No personal info found matching "${query}".` }] };
-      }
-      const text = (data as Array<Record<string, unknown>>)
-        .map((r, i) => `${i + 1}. [${String(r.category)}] ${String(r.key)}: ${String(r.value)} (${(Number(r.similarity) * 100).toFixed(1)}% match)`)
-        .join("\n");
-      return { content: [{ type: "text", text }] };
+      const items = ((data ?? []) as Array<Record<string, unknown>>).map((row) => ({
+        key: row.key,
+        value: row.value,
+        category: row.category,
+        updated_at: row.updated_at ?? null,
+        snippet: makeSnippet(`${String(row.key)}: ${String(row.value)}`),
+        score: Number(row.similarity ?? 0),
+        matched_fields: collectMatchedFields(query, {
+          key: row.key,
+          value: row.value,
+          category: row.category,
+        }),
+      }));
+      return jsonToolResult({
+        ok: true,
+        data: { results: items },
+        error: null,
+        meta: {
+          query,
+          limit: effectiveLimit,
+          threshold: effectiveThreshold,
+          result_count: items.length,
+        },
+      });
     }
   );
 
@@ -966,15 +1041,17 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       description: "List projects with optional status filter.",
       inputSchema: z.object({
         include_archived: z.boolean().optional(),
+        updated_since: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ include_archived, limit }) => {
+    async ({ include_archived, updated_since, limit }) => {
       let query = supabase.from("projects")
-        .select("id, name, description, status, created_at");
+        .select("id, name, description, status, created_at, updated_at");
       if (!include_archived) query = query.eq("status", "active");
-      query = query.order("created_at", { ascending: false }).limit(limit ?? 20);
+      if (updated_since) query = query.gte("updated_at", updated_since);
+      query = query.order("updated_at", { ascending: false }).limit(limit ?? 20);
       const { data, error } = await query;
       if (error) throw new Error(error.message);
       if (!data || !data.length) return { content: [{ type: "text", text: "No projects found." }] };
@@ -1216,13 +1293,14 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         priority: z.enum(TASK_PRIORITIES).optional(),
         project_id: z.string().optional(),
         include_done: z.boolean().optional(),
+        updated_since: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ status, priority, project_id, include_done, limit }) => {
+    async ({ status, priority, project_id, include_done, updated_since, limit }) => {
       let query = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, created_at");
+        .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at");
       if (status) {
         query = query.eq("status", status.toLowerCase().trim());
       } else if (!include_done) {
@@ -1230,6 +1308,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }
       if (priority) query = query.eq("priority", priority.toLowerCase().trim());
       if (project_id) query = query.eq("project_id", project_id);
+      if (updated_since) query = query.gte("updated_at", updated_since);
       query = query.order("priority", { ascending: true })
         .order("due_date", { ascending: true, nullsFirst: false })
         .order("created_at", { ascending: false })
@@ -1313,16 +1392,18 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       inputSchema: z.object({
         task_id: z.string(),
         type: z.enum(TASK_NOTE_TYPES).optional(),
+        updated_since: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ task_id, type, limit }) => {
+    async ({ task_id, type, updated_since, limit }) => {
       let query = supabase.from("task_notes")
         .select("id, content, type, created_at, updated_at")
         .eq("task_id", task_id);
       if (type) query = query.eq("type", type.toLowerCase().trim());
-      query = query.order("created_at", { ascending: false }).limit(limit ?? 20);
+      if (updated_since) query = query.gte("updated_at", updated_since);
+      query = query.order("updated_at", { ascending: false }).limit(limit ?? 20);
       const { data, error } = await query;
       if (error) throw new Error(error.message);
       if (!data || !data.length) return { content: [{ type: "text", text: `No notes found for task "${task_id}".` }] };
