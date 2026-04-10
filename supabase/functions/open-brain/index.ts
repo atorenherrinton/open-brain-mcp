@@ -1005,7 +1005,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (!project) throw new Error(`No project found with ID "${project_id}".`);
 
       let taskQuery = supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at, updated_at")
+        .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at")
         .eq("project_id", project_id);
       if (!include_done) taskQuery = taskQuery.neq("status", "done");
       taskQuery = taskQuery
@@ -1283,7 +1283,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async ({ task_id, note_limit }) => {
       const { data: task, error: taskError } = await supabase.from("tasks")
-        .select("id, title, description, status, priority, due_date, project_id, working_dir, created_at, updated_at")
+        .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at")
         .eq("id", task_id)
         .single();
       if (taskError) throw new Error(taskError.message);
