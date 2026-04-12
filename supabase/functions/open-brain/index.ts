@@ -5,9 +5,9 @@ import { z } from "npm:zod@3.24.1";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
-const SERVER_VERSION = "1.1.0";
+const SERVER_VERSION = "1.2.0";
 const PROJECT_STATUSES = ["active", "archived"] as const;
-const TASK_STATUSES = ["todo", "in_progress", "done"] as const;
+const TASK_STATUSES = ["todo", "in_progress", "done", "archived"] as const;
 const TASK_PRIORITIES = ["low", "medium", "high"] as const;
 const TASK_NOTE_TYPES = ["note", "deliverable"] as const;
 
@@ -71,6 +71,14 @@ function collectMatchedFields(query: string, candidates: Record<string, unknown>
     }
   }
   return matched.length ? matched : ["semantic_match"];
+}
+
+function normalizeTopicTags(topics: unknown) {
+  if (!Array.isArray(topics)) return [];
+  const normalized = topics
+    .map((topic) => String(topic ?? "").trim().toLowerCase())
+    .filter(Boolean);
+  return Array.from(new Set(normalized)).slice(0, 3);
 }
 
 async function getEmbedding(text: string) {
@@ -392,7 +400,9 @@ async function captureThought(
     extractMetadata(normalizedContent),
   ]);
 
-  const payload = { ...metadata, source };
+  const normalizedTopics = normalizeTopicTags((metadata as Record<string, unknown> | null)?.topics);
+  const effectiveMetadata = normalizedTopics.length ? { ...metadata, topics: normalizedTopics } : metadata;
+  const payload = { ...effectiveMetadata, source };
   const { data, error } = await supabase.rpc("insert_thought", {
     p_content: normalizedContent,
     p_embedding: vectorLiteral(embedding),
@@ -404,11 +414,11 @@ async function captureThought(
   }
 
   const row = Array.isArray(data) ? data[0] : data;
-  let confirmation = `Captured as ${metadata.type || "thought"}`;
-  if (metadata.topics?.length) confirmation += ` — ${metadata.topics.join(", ")}`;
-  if (metadata.people?.length) confirmation += ` | People: ${metadata.people.join(", ")}`;
-  if (metadata.action_items?.length) {
-    confirmation += ` | Actions: ${metadata.action_items.join("; ")}`;
+  let confirmation = `Captured as ${effectiveMetadata.type || "thought"}`;
+  if (effectiveMetadata.topics?.length) confirmation += ` — ${effectiveMetadata.topics.join(", ")}`;
+  if (effectiveMetadata.people?.length) confirmation += ` | People: ${effectiveMetadata.people.join(", ")}`;
+  if (effectiveMetadata.action_items?.length) {
+    confirmation += ` | Actions: ${effectiveMetadata.action_items.join("; ")}`;
   }
 
   return {
@@ -416,7 +426,7 @@ async function captureThought(
     id: row?.id,
     created_at: row?.created_at,
     confirmation,
-    metadata,
+    metadata: effectiveMetadata,
   };
 }
 
@@ -1358,6 +1368,21 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   );
 
   registerTool(
+    "delete_task",
+    {
+      description: "Delete a task by its ID. Associated task notes are deleted automatically.",
+      inputSchema: z.object({ task_id: z.string() }),
+    },
+    async ({ task_id }) => {
+      const { data, error } = await supabase.from("tasks").delete().eq("id", task_id)
+        .select("id, title").maybeSingle();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
+      return { content: [{ type: "text", text: `Deleted task "${data.title}" (${data.id}).` }] };
+    }
+  );
+
+  registerTool(
     "list_tasks",
     {
       description: "List tasks with optional filters by status, priority, project, or due date.",
@@ -1366,19 +1391,21 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
         priority: z.enum(TASK_PRIORITIES).optional(),
         project_id: z.string().optional(),
         include_done: z.boolean().optional(),
+        include_archived: z.boolean().optional(),
         updated_since: z.string().optional(),
         cursor: z.string().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ status, priority, project_id, include_done, updated_since, limit }) => {
+    async ({ status, priority, project_id, include_done, include_archived, updated_since, limit }) => {
       let query = supabase.from("tasks")
         .select("id, title, description, status, priority, due_date, project_id, created_at, updated_at");
       if (status) {
         query = query.eq("status", status.toLowerCase().trim());
-      } else if (!include_done) {
-        query = query.neq("status", "done");
+      } else {
+        if (!include_done) query = query.neq("status", "done");
+        if (!include_archived) query = query.neq("status", "archived");
       }
       if (priority) query = query.eq("priority", priority.toLowerCase().trim());
       if (project_id) query = query.eq("project_id", project_id);
@@ -1409,16 +1436,18 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       inputSchema: z.object({
         query: z.string(),
         include_done: z.boolean().optional(),
+        include_archived: z.boolean().optional(),
         limit: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },
     },
-    async ({ query, include_done, limit }) => {
+    async ({ query, include_done, include_archived, limit }) => {
       const pattern = `%${query}%`;
       let q = supabase.from("tasks")
         .select("id, title, description, status, priority, due_date, project_id, created_at")
         .or(`title.ilike.${pattern},description.ilike.${pattern},status.ilike.${pattern},priority.ilike.${pattern}`);
       if (!include_done) q = q.neq("status", "done");
+      if (!include_archived) q = q.neq("status", "archived");
       q = q.order("created_at", { ascending: false }).limit(limit ?? 20);
       const { data, error } = await q;
       if (error) throw new Error(error.message);
