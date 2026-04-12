@@ -3,6 +3,7 @@
   "version": "2.0.0",
   "description": "Personal capture + task system. MCP backend on Supabase Edge Functions; daily task dispatch via launchd + headless claude.",
   "scripts": {
+    "test": "node --test",
     "supabase:db:push": "supabase db push",
     "supabase:functions:serve": "supabase functions serve open-brain --no-verify-jwt",
     "supabase:functions:deploy": "supabase functions deploy open-brain --no-verify-jwt"
