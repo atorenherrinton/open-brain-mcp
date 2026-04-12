@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -28,6 +29,11 @@ jobs:
 
       - name: setup supabase cli
         uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: supabase version
+        run: supabase --version
 
       - name: deploy open-brain function
         env:
@@ -37,4 +43,3 @@ jobs:
           supabase functions deploy open-brain \
             --project-ref "$SUPABASE_PROJECT_REF" \
             --no-verify-jwt
-
