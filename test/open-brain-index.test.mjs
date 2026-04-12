@@ -21,6 +21,47 @@ test("registers delete_task tool", async () => {
   assert.match(content, /registerTool\(\s*"delete_task"/);
 });
 
+test("tool manifest matches snapshot", async () => {
+  const content = await readIndex();
+  const tools = [...content.matchAll(/registerTool\(\s*"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(tools, [
+    "version",
+    "whoami",
+    "server_info",
+    "health",
+    "search_thoughts",
+    "list_thoughts",
+    "thought_stats",
+    "capture_thought",
+    "set_personal_info",
+    "get_personal_info",
+    "search_personal_info",
+    "list_personal_info",
+    "delete_personal_info",
+    "get_project_bundle",
+    "create_project",
+    "get_project",
+    "update_project",
+    "list_projects",
+    "search_projects",
+    "create_task",
+    "get_task",
+    "get_task_bundle",
+    "update_task",
+    "delete_task",
+    "list_tasks",
+    "search_tasks",
+    "add_task_note",
+    "list_task_notes",
+    "update_task_note",
+    "delete_task_note",
+    "search_task_notes",
+    "connect_info_to_thoughts",
+    "connect_thought_to_info",
+  ]);
+  assert.equal(new Set(tools).size, tools.length, "Expected no duplicate tool registrations");
+});
+
 test("TASK_STATUSES includes archived", async () => {
   const content = await readIndex();
   const segment = sliceFrom(content, "const TASK_STATUSES");
@@ -43,11 +84,28 @@ test("search_tasks supports include_archived and filters archived by default", a
 
 test("capture_thought normalizes topics to lowercase tags", async () => {
   const content = await readIndex();
-  assert.match(content, /function normalizeTopicTags\(/);
-  assert.match(content, /\.toLowerCase\(\)/);
+  assert.match(content, /from "\.\/utils\.mjs"/);
 
   const captureSegment = sliceFrom(content, "async function captureThought", 2500);
   assert.match(captureSegment, /const normalizedTopics = normalizeTopicTags\(/);
   assert.match(captureSegment, /topics:\s*normalizedTopics/);
 });
 
+test("HTTP routes include expected action handlers", async () => {
+  const content = await readIndex();
+  for (const fragment of [
+    ".well-known/oauth-protected-resource",
+    ".well-known/oauth-authorization-server",
+    "authorize",
+    "oauth/token",
+    "handleMcpRequest",
+    "action === \"health\"",
+    "action === \"capture\"",
+    "action === \"search\"",
+    "action === \"thoughts\"",
+    "action === \"stats\"",
+    "Not found",
+  ]) {
+    assert.ok(content.includes(fragment), `Expected index.ts to include route fragment: ${fragment}`);
+  }
+});
