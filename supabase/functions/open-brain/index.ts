@@ -2,21 +2,10 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 import { McpServer } from "npm:@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "npm:@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "npm:zod@3.24.1";
-import {
-  collectMatchedFields,
-  getAction,
-  jsonToolResult,
-  makeSnippet,
-  normalizeContent,
-  normalizeTopicTags,
-  normalizeToolError,
-  normalizeToolResult,
-  vectorLiteral,
-} from "./utils.mjs";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
-const SERVER_VERSION = "1.2.0";
+const SERVER_VERSION = "1.3.0";
 const PROJECT_STATUSES = ["active", "archived"] as const;
 const TASK_STATUSES = ["todo", "in_progress", "done", "archived"] as const;
 const TASK_PRIORITIES = ["low", "medium", "high"] as const;
@@ -44,6 +33,44 @@ function requireEnv(name: string) {
 
 function requireSupabaseServiceRoleKey() {
   return Deno.env.get("SUPABASE_SECRET_KEY") || requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+}
+
+function vectorLiteral(values: number[]) {
+  return `[${values.join(",")}]`;
+}
+
+function normalizeContent(content: unknown) {
+  return String(content ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/^[\t ]+/gm, "")
+    .replace(/[\t ]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function jsonToolResult(payload: Record<string, unknown>) {
+  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+}
+
+function makeSnippet(value: unknown, max = 180) {
+  const text = normalizeContent(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
+}
+
+function collectMatchedFields(query: string, candidates: Record<string, unknown>) {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const matched: string[] = [];
+  for (const [field, value] of Object.entries(candidates)) {
+    const haystack = Array.isArray(value)
+      ? value.map((entry) => String(entry).toLowerCase()).join(" ")
+      : String(value ?? "").toLowerCase();
+    if (tokens.some((token) => haystack.includes(token))) {
+      matched.push(field);
+    }
+  }
+  return matched.length ? matched : ["semantic_match"];
 }
 
 async function getEmbedding(text: string) {
@@ -326,6 +353,15 @@ async function requireAuth(req: Request, baseUrl?: string) {
   }
 }
 
+function getAction(url: URL) {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const functionIndex = parts.lastIndexOf("open-brain");
+  if (functionIndex === -1) {
+    return url.searchParams.get("action") || "";
+  }
+  return parts.slice(functionIndex + 1).join("/") || url.searchParams.get("action") || "";
+}
+
 async function getThoughtCount(supabase: ReturnType<typeof createClient>) {
   const { count, error } = await supabase.from("thoughts").select("id", { count: "exact", head: true });
   if (error) {
@@ -356,9 +392,7 @@ async function captureThought(
     extractMetadata(normalizedContent),
   ]);
 
-  const normalizedTopics = normalizeTopicTags((metadata as Record<string, unknown> | null)?.topics);
-  const effectiveMetadata = normalizedTopics.length ? { ...metadata, topics: normalizedTopics } : metadata;
-  const payload = { ...effectiveMetadata, source };
+  const payload = { ...metadata, source };
   const { data, error } = await supabase.rpc("insert_thought", {
     p_content: normalizedContent,
     p_embedding: vectorLiteral(embedding),
@@ -370,11 +404,11 @@ async function captureThought(
   }
 
   const row = Array.isArray(data) ? data[0] : data;
-  let confirmation = `Captured as ${effectiveMetadata.type || "thought"}`;
-  if (effectiveMetadata.topics?.length) confirmation += ` — ${effectiveMetadata.topics.join(", ")}`;
-  if (effectiveMetadata.people?.length) confirmation += ` | People: ${effectiveMetadata.people.join(", ")}`;
-  if (effectiveMetadata.action_items?.length) {
-    confirmation += ` | Actions: ${effectiveMetadata.action_items.join("; ")}`;
+  let confirmation = `Captured as ${metadata.type || "thought"}`;
+  if (metadata.topics?.length) confirmation += ` — ${metadata.topics.join(", ")}`;
+  if (metadata.people?.length) confirmation += ` | People: ${metadata.people.join(", ")}`;
+  if (metadata.action_items?.length) {
+    confirmation += ` | Actions: ${metadata.action_items.join("; ")}`;
   }
 
   return {
@@ -382,7 +416,7 @@ async function captureThought(
     id: row?.id,
     created_at: row?.created_at,
     confirmation,
-    metadata: effectiveMetadata,
+    metadata,
   };
 }
 
@@ -526,6 +560,51 @@ function formatStats(stats: Record<string, unknown>) {
 
   return lines.join("\n");
 }
+
+function inferToolErrorCode(message: string) {
+  const lower = message.toLowerCase();
+  if (lower.includes("not found") || lower.startsWith("no ")) return "NOT_FOUND";
+  if (lower.includes("invalid") || lower.includes("required") || lower.includes("cannot be empty") || lower.includes("no fields to update")) return "VALIDATION_ERROR";
+  if (lower.includes("already exists") || lower.includes("duplicate") || lower.includes("conflict")) return "CONFLICT";
+  if (lower.includes("too many") || lower.includes("rate limit") || lower.includes("429")) return "RATE_LIMITED";
+  if (lower.includes("unauthorized") || lower.includes("forbidden") || lower.includes("access key") || lower.includes("expired token")) return "AUTH_ERROR";
+  if (lower.includes("missing")) return "CONFIG_ERROR";
+  return "INTERNAL_ERROR";
+}
+
+function normalizeToolResult(result: unknown) {
+  if (result && typeof result === "object" && "content" in result) {
+    const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
+    if (Array.isArray(content) && content.length === 1 && content[0]?.type === "text") {
+      const text = String(content[0].text ?? "");
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "ok" in parsed && "data" in parsed && "error" in parsed && "meta" in parsed) {
+          return result;
+        }
+      } catch {
+        // plain text result, wrap below
+      }
+      const code = inferToolErrorCode(text);
+      if (code === "NOT_FOUND") {
+        return jsonToolResult({ ok: false, data: null, error: { code, message: text }, meta: {} });
+      }
+      return jsonToolResult({ ok: true, data: { message: text }, error: null, meta: {} });
+    }
+    return result;
+  }
+  return jsonToolResult({ ok: true, data: result ?? null, error: null, meta: {} });
+}
+
+function normalizeToolError(error: unknown) {
+  if (error instanceof Response) {
+    const message = `HTTP ${error.status}`;
+    return { code: inferToolErrorCode(message), message };
+  }
+  const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+  return { code: inferToolErrorCode(message), message };
+}
+
 
 async function handleMcpRequest(req: Request, supabase: ReturnType<typeof createClient>) {
   const server = new McpServer(
@@ -1241,7 +1320,7 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   registerTool(
     "update_task",
     {
-      description: "Update a task's title, description, status, priority, due date, or project. To mark a task as done, set status to 'done'. Setting status back to 'todo' makes the task eligible for the next daily dispatcher run.",
+      description: "Update a task's title, description, status, priority, due date, or project. To mark a task as done, set status to 'done'. To archive a task (soft delete), set status to 'archived'. Setting status back to 'todo' makes the task eligible for the next daily dispatcher run.",
       inputSchema: z.object({
         task_id: z.string(),
         title: z.string().optional(),
@@ -1281,15 +1360,64 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   registerTool(
     "delete_task",
     {
-      description: "Delete a task by its ID. Associated task notes are deleted automatically.",
+      description: "Permanently delete a task by its ID. Associated task notes are automatically deleted via database cascade. Prefer setting status to 'archived' for soft deletion.",
       inputSchema: z.object({ task_id: z.string() }),
     },
     async ({ task_id }) => {
       const { data, error } = await supabase.from("tasks").delete().eq("id", task_id)
-        .select("id, title").maybeSingle();
+        .select("id, title").single();
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
       return { content: [{ type: "text", text: `Deleted task "${data.title}" (${data.id}).` }] };
+    }
+  );
+
+  registerTool(
+    "bulk_delete_tasks",
+    {
+      description: "Permanently delete multiple tasks by their IDs in a single operation. Associated task notes are automatically deleted via database cascade.",
+      inputSchema: z.object({
+        task_ids: z.array(z.string()).min(1).max(50),
+      }),
+    },
+    async ({ task_ids }) => {
+      const { data, error } = await supabase.from("tasks").delete()
+        .in("id", task_ids)
+        .select("id, title");
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: "No matching tasks found to delete." }] };
+      const lines = (data as Array<Record<string, unknown>>).map(
+        (t) => `- "${t.title}" (${t.id})`
+      );
+      return { content: [{ type: "text", text: `Deleted ${data.length} task(s):\n${lines.join("\n")}` }] };
+    }
+  );
+
+  registerTool(
+    "bulk_update_tasks",
+    {
+      description: "Update multiple tasks at once. Apply the same status and/or priority change to a list of task IDs. Useful for batch status transitions (e.g., marking several tasks as done or archived).",
+      inputSchema: z.object({
+        task_ids: z.array(z.string()).min(1).max(50),
+        status: z.enum(TASK_STATUSES).optional(),
+        priority: z.enum(TASK_PRIORITIES).optional(),
+      }),
+    },
+    async ({ task_ids, status, priority }) => {
+      const updates: Record<string, unknown> = {};
+      if (status !== undefined) updates.status = status.toLowerCase().trim();
+      if (priority !== undefined) updates.priority = priority.toLowerCase().trim();
+      if (!Object.keys(updates).length) throw new Error("No fields to update. Provide at least status or priority.");
+
+      const { data, error } = await supabase.from("tasks").update(updates)
+        .in("id", task_ids)
+        .select("id, title, status, priority");
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: "No matching tasks found to update." }] };
+      const lines = (data as Array<Record<string, unknown>>).map(
+        (t) => `- "${t.title}" [${t.status}, ${t.priority}]`
+      );
+      return { content: [{ type: "text", text: `Updated ${data.length} task(s):\n${lines.join("\n")}` }] };
     }
   );
 
