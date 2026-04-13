@@ -16,7 +16,7 @@ import {
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_THOUGHT_CHARS = 12000;
-const SERVER_VERSION = "1.2.0";
+const SERVER_VERSION = "1.3.0";
 const PROJECT_STATUSES = ["active", "archived"] as const;
 const TASK_STATUSES = ["todo", "in_progress", "done", "archived"] as const;
 const TASK_PRIORITIES = ["low", "medium", "high"] as const;
@@ -1290,6 +1290,55 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       if (error) throw new Error(error.message);
       if (!data) return { content: [{ type: "text", text: `No task found with ID "${task_id}".` }] };
       return { content: [{ type: "text", text: `Deleted task "${data.title}" (${data.id}).` }] };
+    }
+  );
+
+  registerTool(
+    "bulk_delete_tasks",
+    {
+      description: "Permanently delete multiple tasks by their IDs in a single operation. Associated task notes are automatically deleted via database cascade.",
+      inputSchema: z.object({
+        task_ids: z.array(z.string()).min(1).max(50),
+      }),
+    },
+    async ({ task_ids }) => {
+      const { data, error } = await supabase.from("tasks").delete()
+        .in("id", task_ids)
+        .select("id, title");
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: "No matching tasks found to delete." }] };
+      const lines = (data as Array<Record<string, unknown>>).map(
+        (t) => `- "${t.title}" (${t.id})`
+      );
+      return { content: [{ type: "text", text: `Deleted ${data.length} task(s):\n${lines.join("\n")}` }] };
+    }
+  );
+
+  registerTool(
+    "bulk_update_tasks",
+    {
+      description: "Update multiple tasks at once. Apply the same status and/or priority change to a list of task IDs. Useful for batch status transitions (e.g., marking several tasks as done or archived).",
+      inputSchema: z.object({
+        task_ids: z.array(z.string()).min(1).max(50),
+        status: z.enum(TASK_STATUSES).optional(),
+        priority: z.enum(TASK_PRIORITIES).optional(),
+      }),
+    },
+    async ({ task_ids, status, priority }) => {
+      const updates: Record<string, unknown> = {};
+      if (status !== undefined) updates.status = status.toLowerCase().trim();
+      if (priority !== undefined) updates.priority = priority.toLowerCase().trim();
+      if (!Object.keys(updates).length) throw new Error("No fields to update. Provide at least status or priority.");
+
+      const { data, error } = await supabase.from("tasks").update(updates)
+        .in("id", task_ids)
+        .select("id, title, status, priority");
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) return { content: [{ type: "text", text: "No matching tasks found to update." }] };
+      const lines = (data as Array<Record<string, unknown>>).map(
+        (t) => `- "${t.title}" [${t.status}, ${t.priority}]`
+      );
+      return { content: [{ type: "text", text: `Updated ${data.length} task(s):\n${lines.join("\n")}` }] };
     }
   );
 

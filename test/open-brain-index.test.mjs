@@ -51,6 +51,8 @@ test("tool manifest matches snapshot", async () => {
     "get_task_bundle",
     "update_task",
     "delete_task",
+    "bulk_delete_tasks",
+    "bulk_update_tasks",
     "list_tasks",
     "search_tasks",
     "add_task_note",
