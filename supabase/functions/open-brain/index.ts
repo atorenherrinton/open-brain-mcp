@@ -768,6 +768,73 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   );
 
   registerTool(
+    "delete_thought",
+    {
+      description: "Delete a thought by its ID.",
+      inputSchema: z.object({ thought_id: z.string() }),
+    },
+    async ({ thought_id }) => {
+      const { data, error } = await supabase.from("thoughts")
+        .delete().eq("id", thought_id)
+        .select("id, content").maybeSingle();
+      if (error) throw new Error(error.message);
+      if (!data) return { content: [{ type: "text", text: `No thought found with ID "${thought_id}".` }] };
+      const snippet = makeSnippet(data.content, 60);
+      return { content: [{ type: "text", text: `Deleted thought: "${snippet}" (${data.id})` }] };
+    }
+  );
+
+  registerTool(
+    "prune_thoughts",
+    {
+      description: "Delete thoughts older than a given number of days. Optionally filter by type or topic. Returns count of deleted thoughts. Use with care — this is irreversible.",
+      inputSchema: z.object({
+        older_than_days: z.number().min(1),
+        type: z.string().optional(),
+        topic: z.string().optional(),
+        dry_run: z.boolean().optional(),
+      }),
+    },
+    async ({ older_than_days, type, topic, dry_run }) => {
+      const cutoff = new Date(Date.now() - older_than_days * 24 * 60 * 60 * 1000).toISOString();
+      let query = supabase.from("thoughts")
+        .select("id, content, metadata, created_at")
+        .lt("created_at", cutoff);
+
+      if (type) {
+        query = query.eq("metadata->>type", type.toLowerCase().trim());
+      }
+      if (topic) {
+        query = query.contains("metadata", { topics: [topic.toLowerCase().trim()] });
+      }
+
+      const { data: candidates, error: selectError } = await query;
+      if (selectError) throw new Error(selectError.message);
+      if (!candidates || !candidates.length) {
+        return { content: [{ type: "text", text: `No thoughts found older than ${older_than_days} days matching the given filters.` }] };
+      }
+
+      if (dry_run) {
+        const previews = candidates.slice(0, 10).map((t) => {
+          const m = (t.metadata as Record<string, unknown> | null) ?? {};
+          return `- [${new Date(t.created_at).toLocaleDateString()}] (${String(m.type || "?")}) ${makeSnippet(t.content, 60)}`;
+        });
+        let text = `Dry run: would delete ${candidates.length} thought(s) older than ${older_than_days} days.`;
+        if (candidates.length > 10) text += ` Showing first 10:`;
+        text += `\n${previews.join("\n")}`;
+        return { content: [{ type: "text", text }] };
+      }
+
+      const ids = candidates.map((t) => t.id);
+      const { error: deleteError } = await supabase.from("thoughts")
+        .delete().in("id", ids);
+      if (deleteError) throw new Error(deleteError.message);
+
+      return { content: [{ type: "text", text: `Pruned ${ids.length} thought(s) older than ${older_than_days} days.` }] };
+    }
+  );
+
+  registerTool(
     "set_personal_info",
     {
       description: "Save or update a piece of personal information (name, birthday, preferences, etc.).",

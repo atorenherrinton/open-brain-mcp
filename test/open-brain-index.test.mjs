@@ -35,6 +35,8 @@ test("tool manifest matches snapshot", async () => {
     "list_thoughts",
     "thought_stats",
     "capture_thought",
+    "delete_thought",
+    "prune_thoughts",
     "set_personal_info",
     "get_personal_info",
     "search_personal_info",
