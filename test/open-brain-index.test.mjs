@@ -31,6 +31,7 @@ test("tool manifest matches snapshot", async () => {
     "whoami",
     "server_info",
     "health",
+    "db_stats",
     "search_thoughts",
     "list_thoughts",
     "thought_stats",

@@ -230,6 +230,38 @@ test("bulk_update_tasks throws when no fields provided", async () => {
   assert.match(segment, /No fields to update/, "Should reject empty updates");
 });
 
+// ─── db_stats ──────────────────────────────────────────────────────────
+
+test("db_stats calls db_overview RPC", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "db_stats");
+  assert.match(segment, /supabase\.rpc\("db_overview"\)/, "Should call db_overview RPC");
+});
+
+test("db_stats reports stale in_progress tasks", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "db_stats");
+  assert.match(segment, /in_progress for >7 days/, "Should flag stale tasks");
+});
+
+test("db_stats reports orphaned task notes", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "db_stats");
+  assert.match(segment, /orphaned task note/, "Should flag orphaned notes");
+});
+
+test("db_stats reports duplicate personal_info keys", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "db_stats");
+  assert.match(segment, /duplicate personal_info key/, "Should flag duplicate keys");
+});
+
+test("db_stats shows 'No issues detected' when clean", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "db_stats");
+  assert.match(segment, /No issues detected/, "Should show clean state");
+});
+
 // ─── Default limits ────────────────────────────────────────────────────
 
 test("search_thoughts defaults to limit 10 and threshold 0.5", async () => {
