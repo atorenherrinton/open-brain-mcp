@@ -318,3 +318,62 @@ test("search_task_notes uses ilike for content and type", async () => {
   assert.match(segment, /content\.ilike/, "Should search content");
   assert.match(segment, /type\.ilike/, "Should search type");
 });
+
+// ─── delete_thought ────────────────────────────────────────────────────
+
+test("delete_thought returns message when thought not found", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "delete_thought");
+  assert.match(segment, /No thought found with ID/, "Should return not-found message");
+});
+
+test("delete_thought uses maybeSingle for safe deletion", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "delete_thought");
+  assert.match(segment, /maybeSingle/, "Should use maybeSingle");
+});
+
+test("delete_thought shows snippet in confirmation", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "delete_thought");
+  assert.match(segment, /makeSnippet/, "Should show content snippet in confirmation");
+});
+
+// ─── prune_thoughts ────────────────────────────────────────────────────
+
+test("prune_thoughts calculates cutoff date from older_than_days", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts", 4000);
+  assert.match(segment, /older_than_days \* 24 \* 60 \* 60 \* 1000/, "Should calculate cutoff in ms");
+});
+
+test("prune_thoughts supports dry_run mode", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts", 4000);
+  assert.match(segment, /dry_run/, "Should support dry_run");
+  assert.match(segment, /Dry run:/, "Should label dry run output");
+});
+
+test("prune_thoughts filters by type when provided", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts", 4000);
+  assert.match(segment, /metadata->>type/, "Should filter by metadata type");
+});
+
+test("prune_thoughts filters by topic when provided", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts", 4000);
+  assert.match(segment, /\.contains\("metadata"/, "Should filter by topic via contains");
+});
+
+test("prune_thoughts returns message when no candidates found", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts", 4000);
+  assert.match(segment, /No thoughts found older than/, "Should return empty message");
+});
+
+test("prune_thoughts limits dry_run preview to 10 items", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts", 4000);
+  assert.match(segment, /\.slice\(0, 10\)/, "Should limit preview to 10");
+});

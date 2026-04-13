@@ -50,7 +50,7 @@ for (const tool of READ_ONLY_TOOLS) {
 }
 
 const MUTATING_TOOLS = [
-  "capture_thought",
+  "capture_thought", "delete_thought", "prune_thoughts",
   "set_personal_info", "delete_personal_info",
   "create_project", "update_project",
   "create_task", "update_task", "delete_task", "bulk_delete_tasks", "bulk_update_tasks",
@@ -189,4 +189,19 @@ test("list_tasks has comprehensive filter options", async () => {
   assert.match(segment, /include_done:\s*z\.boolean\(\)\.optional\(\)/);
   assert.match(segment, /include_archived:\s*z\.boolean\(\)\.optional\(\)/);
   assert.match(segment, /updated_since:\s*z\.string\(\)\.optional\(\)/);
+});
+
+test("delete_thought requires thought_id", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "delete_thought");
+  assert.match(segment, /thought_id:\s*z\.string\(\)/);
+});
+
+test("prune_thoughts requires older_than_days, optional type/topic/dry_run", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "prune_thoughts");
+  assert.match(segment, /older_than_days:\s*z\.number\(\)\.min\(1\)/);
+  assert.match(segment, /type:\s*z\.string\(\)\.optional\(\)/);
+  assert.match(segment, /topic:\s*z\.string\(\)\.optional\(\)/);
+  assert.match(segment, /dry_run:\s*z\.boolean\(\)\.optional\(\)/);
 });
