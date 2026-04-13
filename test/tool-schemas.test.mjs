@@ -32,7 +32,7 @@ function sliceTool(content, toolName, length = 3000) {
 // ─── Read-only annotations ─────────────────────────────────────────────
 
 const READ_ONLY_TOOLS = [
-  "version", "whoami", "server_info", "health",
+  "version", "whoami", "server_info", "health", "db_stats",
   "search_thoughts", "list_thoughts", "thought_stats",
   "get_personal_info", "search_personal_info", "list_personal_info",
   "get_project_bundle", "get_project", "list_projects", "search_projects",

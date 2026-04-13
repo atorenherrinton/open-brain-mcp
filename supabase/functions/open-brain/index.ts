@@ -669,6 +669,36 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
   );
 
   registerTool(
+    "db_stats",
+    {
+      description: "Database overview with counts by status/category plus potential issues (stale tasks, orphaned notes, duplicate keys). Use at the start of a session for a quick audit instead of running multiple list queries.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const { data, error } = await supabase.rpc("db_overview");
+      if (error) throw new Error(error.message);
+
+      const stats = data as Record<string, unknown>;
+      const staleTasks = stats.stale_in_progress_tasks as Array<Record<string, unknown>> ?? [];
+      const orphanedNotes = stats.orphaned_task_notes as number ?? 0;
+      const duplicateKeys = stats.duplicate_personal_info_keys as Array<Record<string, unknown>> ?? [];
+
+      const issues: string[] = [];
+      if (staleTasks.length) issues.push(`${staleTasks.length} task(s) in_progress for >7 days`);
+      if (orphanedNotes > 0) issues.push(`${orphanedNotes} orphaned task note(s)`);
+      if (duplicateKeys.length) issues.push(`${duplicateKeys.length} duplicate personal_info key(s)`);
+
+      return jsonToolResult({
+        ok: true,
+        data: { ...stats, issues: issues.length ? issues : ["No issues detected"] },
+        error: null,
+        meta: {},
+      });
+    }
+  );
+
+  registerTool(
     "search_thoughts",
     {
       description: "Search captured thoughts by meaning.",
