@@ -35,6 +35,7 @@ const READ_ONLY_TOOLS = [
   "version", "whoami", "server_info", "health", "db_stats",
   "search_thoughts", "list_thoughts", "thought_stats",
   "get_personal_info", "search_personal_info", "list_personal_info",
+  "get_job_profile", "get_answer_bank",
   "get_project_bundle", "get_project", "list_projects", "search_projects",
   "get_task", "get_task_bundle", "list_tasks", "search_tasks",
   "list_task_notes", "search_task_notes",
@@ -51,7 +52,7 @@ for (const tool of READ_ONLY_TOOLS) {
 
 const MUTATING_TOOLS = [
   "capture_thought", "delete_thought", "prune_thoughts",
-  "set_personal_info", "delete_personal_info",
+  "set_personal_info", "delete_personal_info", "add_answer",
   "create_project", "update_project",
   "create_task", "update_task", "delete_task", "bulk_delete_tasks", "bulk_update_tasks",
   "add_task_note", "update_task_note", "delete_task_note",

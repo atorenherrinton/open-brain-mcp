@@ -1000,6 +1000,138 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
+  // ── Job search tools ──
+  // Thin wrappers over personal_info for the `job_search.profile` and
+  // `job_search.answer_bank` blobs. They parse the stored JSON so callers
+  // don't have to, and `add_answer` provides the partial-update path for
+  // the answer bank's nested arrays.
+
+  async function readJobSearchBlob(key: string) {
+    const { data, error } = await supabase.rpc("get_personal_info", { p_key: key });
+    if (error) throw new Error(error.message);
+    if (!data || (Array.isArray(data) && !data.length)) return null;
+    const row = Array.isArray(data) ? data[0] : data;
+    try {
+      return { row, parsed: JSON.parse(String(row.value)) };
+    } catch (err) {
+      throw new Error(`Stored ${key} is not valid JSON: ${(err as Error).message}`);
+    }
+  }
+
+  async function writeJobSearchBlob(key: string, value: unknown) {
+    const serialized = JSON.stringify(value);
+    const embedding = await getEmbedding(`${key}: ${serialized}`);
+    const { error } = await supabase.rpc("upsert_personal_info", {
+      p_key: key,
+      p_value: serialized,
+      p_category: "job_search",
+      p_embedding: vectorLiteral(embedding),
+    });
+    if (error) throw new Error(error.message);
+  }
+
+  registerTool(
+    "get_job_profile",
+    {
+      description: "Return the parsed job_search.profile object (identity, work preferences, compensation, application defaults, etc.). Use this instead of get_personal_info when you need to read the profile as structured data.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const blob = await readJobSearchBlob("job_search.profile");
+      if (!blob) {
+        return { content: [{ type: "text", text: "No job_search.profile set." }] };
+      }
+      return jsonToolResult({
+        ok: true,
+        data: { profile: blob.parsed, updated_at: blob.row.updated_at ?? null },
+        error: null,
+        meta: {},
+      });
+    }
+  );
+
+  registerTool(
+    "get_answer_bank",
+    {
+      description: "Return the parsed job_search.answer_bank object (short_answers, availability_answers, work_auth_answers, compensation_answers, logistics_answers, resume_snippets, cover_letter_paragraphs, platform_specific). Use this instead of get_personal_info when you need structured access.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const blob = await readJobSearchBlob("job_search.answer_bank");
+      if (!blob) {
+        return { content: [{ type: "text", text: "No job_search.answer_bank set." }] };
+      }
+      return jsonToolResult({
+        ok: true,
+        data: { answer_bank: blob.parsed, updated_at: blob.row.updated_at ?? null },
+        error: null,
+        meta: {},
+      });
+    }
+  );
+
+  registerTool(
+    "add_answer",
+    {
+      description: "Append a new answer to the job_search.answer_bank under the given category and question_type (e.g., category='short_answers', question_type='why_this_role'). Avoids a read-modify-write by the caller. `id` must be unique within the question_type; defaults approved=false, source='drafted_by_assistant'.",
+      inputSchema: z.object({
+        category: z.string(),
+        question_type: z.string(),
+        id: z.string(),
+        text: z.string(),
+        approved: z.boolean().optional(),
+        source: z.string().optional(),
+      }),
+    },
+    async ({ category, question_type, id, text, approved, source }) => {
+      const cat = category.trim();
+      const qtype = question_type.trim();
+      const answerId = id.trim();
+      const body = text.trim();
+      if (!cat || !qtype || !answerId || !body) {
+        throw new Error("category, question_type, id, and text are required and non-empty.");
+      }
+
+      const blob = await readJobSearchBlob("job_search.answer_bank");
+      if (!blob) {
+        throw new Error("No job_search.answer_bank set. Initialize it with set_personal_info first.");
+      }
+
+      const bank = blob.parsed as Record<string, unknown>;
+      const section = bank[cat];
+      if (!section || typeof section !== "object") {
+        throw new Error(`Unknown answer_bank category "${cat}".`);
+      }
+      const sectionObj = section as Record<string, unknown>;
+      const existing = sectionObj[qtype];
+      const list = Array.isArray(existing) ? existing.slice() : [];
+
+      if (list.some((entry) => entry && typeof entry === "object" && (entry as { id?: unknown }).id === answerId)) {
+        throw new Error(`Answer id "${answerId}" already exists in ${cat}.${qtype}.`);
+      }
+
+      list.push({
+        id: answerId,
+        text: body,
+        approved: approved ?? false,
+        source: (source ?? "drafted_by_assistant").trim(),
+        last_reviewed: new Date().toISOString().slice(0, 10),
+      });
+      sectionObj[qtype] = list;
+      bank[cat] = sectionObj;
+
+      const metadata = (bank.metadata && typeof bank.metadata === "object") ? bank.metadata as Record<string, unknown> : {};
+      metadata.updated_at = new Date().toISOString().slice(0, 10);
+      bank.metadata = metadata;
+
+      await writeJobSearchBlob("job_search.answer_bank", bank);
+
+      return { content: [{ type: "text", text: `Added answer "${answerId}" to ${cat}.${qtype}.` }] };
+    }
+  );
+
   // ── Project tools ──
 
   registerTool(
