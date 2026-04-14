@@ -117,6 +117,76 @@ test("update_task returns message when task not found", async () => {
   assert.match(segment, /No task found with ID/, "Should return not-found message");
 });
 
+// ─── Job search tools ─────────────────────────────────────────────────
+
+test("get_job_profile returns not-set message when missing", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "get_job_profile");
+  assert.match(segment, /No job_search\.profile set/, "Should return not-set message");
+});
+
+test("get_job_profile reads from job_search.profile key", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "get_job_profile");
+  assert.match(segment, /job_search\.profile/, "Should read job_search.profile key");
+});
+
+test("get_answer_bank returns not-set message when missing", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "get_answer_bank");
+  assert.match(segment, /No job_search\.answer_bank set/, "Should return not-set message");
+});
+
+test("get_answer_bank reads from job_search.answer_bank key", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "get_answer_bank");
+  assert.match(segment, /job_search\.answer_bank/, "Should read job_search.answer_bank key");
+});
+
+test("add_answer requires non-empty category, question_type, id, and text", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "add_answer");
+  assert.match(segment, /category, question_type, id, and text are required/, "Should validate required fields");
+});
+
+test("add_answer rejects duplicate ids within the same question_type", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "add_answer");
+  assert.match(segment, /already exists in/, "Should reject duplicate ids");
+});
+
+test("add_answer rejects unknown answer_bank category", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "add_answer");
+  assert.match(segment, /Unknown answer_bank category/, "Should reject unknown categories");
+});
+
+test("add_answer defaults approved to false and source to drafted_by_assistant", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "add_answer");
+  assert.match(segment, /approved \?\? false/, "Should default approved to false");
+  assert.match(segment, /"drafted_by_assistant"/, "Should default source to drafted_by_assistant");
+});
+
+test("add_answer bumps answer_bank metadata.updated_at", async () => {
+  const content = await readIndex();
+  const segment = sliceTool(content, "add_answer");
+  assert.match(segment, /metadata\.updated_at = new Date\(\)/, "Should update metadata timestamp");
+});
+
+test("readJobSearchBlob throws on invalid JSON", async () => {
+  const content = await readIndex();
+  const segment = sliceFrom(content, "async function readJobSearchBlob");
+  assert.match(segment, /is not valid JSON/, "Should throw on bad JSON");
+});
+
+test("writeJobSearchBlob uses job_search category and regenerates embedding", async () => {
+  const content = await readIndex();
+  const segment = sliceFrom(content, "async function writeJobSearchBlob");
+  assert.match(segment, /p_category: "job_search"/, "Should write under job_search category");
+  assert.match(segment, /getEmbedding/, "Should regenerate embedding on write");
+});
+
 test("delete_task returns message when task not found", async () => {
   const content = await readIndex();
   const segment = sliceTool(content, "delete_task");
