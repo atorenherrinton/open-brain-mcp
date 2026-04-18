@@ -68,6 +68,9 @@ test("tool manifest matches snapshot", async () => {
     "search_task_notes",
     "connect_info_to_thoughts",
     "connect_thought_to_info",
+    "list_ci_failures",
+    "get_ci_failure",
+    "resolve_ci_failure",
   ]);
   assert.equal(new Set(tools).size, tools.length, "Expected no duplicate tool registrations");
 });
