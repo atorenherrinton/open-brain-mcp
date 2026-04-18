@@ -40,6 +40,7 @@ const READ_ONLY_TOOLS = [
   "get_task", "get_task_bundle", "list_tasks", "search_tasks",
   "list_task_notes", "search_task_notes",
   "connect_info_to_thoughts", "connect_thought_to_info",
+  "list_ci_failures", "get_ci_failure",
 ];
 
 for (const tool of READ_ONLY_TOOLS) {
@@ -56,6 +57,7 @@ const MUTATING_TOOLS = [
   "create_project", "update_project",
   "create_task", "update_task", "delete_task", "bulk_delete_tasks", "bulk_update_tasks",
   "add_task_note", "update_task_note", "delete_task_note",
+  "resolve_ci_failure",
 ];
 
 for (const tool of MUTATING_TOOLS) {
