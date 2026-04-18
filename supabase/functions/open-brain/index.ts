@@ -1892,6 +1892,171 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     }
   );
 
+  // ── ci_failures tools ──
+  //
+  // ci_failures rows are populated by the ci-triage Edge Function on
+  // each Cloud Build run. Each row represents a single failing test +
+  // fixture identity. These tools let an agent answer "what's broken
+  // right now?" without writing SQL, and close stale rows manually
+  // when the failing test has been deleted upstream.
+
+  const CI_FAILURE_STATUSES = ["open", "resolved", "all"] as const;
+
+  function formatCiFailureLine(
+    f: Record<string, unknown>,
+  ): string {
+    const resolved = f.resolved_at ? ` — resolved ${new Date(String(f.resolved_at)).toLocaleDateString()}` : "";
+    const fixture = f.fixture_id ? `/${f.fixture_id}` : "";
+    const streak = Number(f.consecutive_failures ?? 0);
+    const streakLabel = resolved ? "" : ` — ${streak} consecutive failure(s)`;
+    const commit = f.last_commit_sha ? ` @${String(f.last_commit_sha).slice(0, 8)}` : "";
+    return `${f.project}/${f.pipeline}: ${f.test_name}${fixture}${streakLabel}${commit}${resolved}`;
+  }
+
+  registerTool(
+    "list_ci_failures",
+    {
+      description: "List CI test failures tracked in the ci_failures table. By default returns only currently-open failures (resolved_at IS NULL), sorted by last_seen desc. Filter by project and/or pipeline to narrow to a specific test surface. Use status='resolved' to see historical regressions, or status='all' to see everything.",
+      inputSchema: z.object({
+        project: z.string().optional(),
+        pipeline: z.string().optional(),
+        status: z.enum(CI_FAILURE_STATUSES).optional(),
+        limit: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ project, pipeline, status, limit }) => {
+      const effectiveStatus = status ?? "open";
+      const effectiveLimit = Math.min(Math.max(limit ?? 50, 1), 200);
+
+      let query = supabase.from("ci_failures").select(
+        "id, project, pipeline, test_name, fixture_id, consecutive_failures, first_seen, last_seen, resolved_at, last_commit_sha, last_build_id, open_brain_task_id",
+      );
+      if (project) query = query.ilike("project", project);
+      if (pipeline) query = query.eq("pipeline", pipeline);
+      if (effectiveStatus === "open") query = query.is("resolved_at", null);
+      if (effectiveStatus === "resolved") query = query.not("resolved_at", "is", null);
+      query = query.order("last_seen", { ascending: false }).limit(effectiveLimit);
+
+      const { data, error } = await query;
+      if (error) throw new Error(error.message);
+      const rows = (data ?? []) as Array<Record<string, unknown>>;
+      if (!rows.length) {
+        const filters = [
+          `status=${effectiveStatus}`,
+          project ? `project=${project}` : null,
+          pipeline ? `pipeline=${pipeline}` : null,
+        ].filter(Boolean).join(", ");
+        return { content: [{ type: "text", text: `No CI failures (${filters}).` }] };
+      }
+      const header = effectiveStatus === "open"
+        ? `${rows.length} open CI failure(s) — oldest first-seen is the most likely regression:`
+        : `${rows.length} CI failure(s) [${effectiveStatus}]:`;
+      const body = rows.map((r, i) => `${i + 1}. ${formatCiFailureLine(r)}\n   ID: ${r.id}`).join("\n");
+      return { content: [{ type: "text", text: `${header}\n\n${body}` }] };
+    },
+  );
+
+  registerTool(
+    "get_ci_failure",
+    {
+      description: "Retrieve a single ci_failures row by ID, including the full last_error_excerpt and the paired Open Brain task (if any). Use this after list_ci_failures to pull context for a specific regression.",
+      inputSchema: z.object({ ci_failure_id: z.string() }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ ci_failure_id }) => {
+      const { data: failure, error } = await supabase.from("ci_failures")
+        .select(
+          "id, project, pipeline, test_name, fixture_id, consecutive_failures, first_seen, last_seen, resolved_at, last_build_id, last_commit_sha, last_error_excerpt, open_brain_task_id",
+        )
+        .eq("id", ci_failure_id)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      if (!failure) {
+        return { content: [{ type: "text", text: `No ci_failures row with ID "${ci_failure_id}".` }] };
+      }
+
+      let task: Record<string, unknown> | null = null;
+      if (failure.open_brain_task_id) {
+        const { data: t } = await supabase.from("tasks")
+          .select("id, title, status, priority, project_id, updated_at")
+          .eq("id", failure.open_brain_task_id)
+          .maybeSingle();
+        task = t as Record<string, unknown> | null;
+      }
+
+      const lines: string[] = [
+        `Project: ${failure.project}`,
+        `Pipeline: ${failure.pipeline}`,
+        `Test: ${failure.test_name}${failure.fixture_id ? `/${failure.fixture_id}` : ""}`,
+        `Status: ${failure.resolved_at ? `resolved ${new Date(String(failure.resolved_at)).toLocaleDateString()}` : `open — ${failure.consecutive_failures} consecutive failure(s)`}`,
+        `First seen: ${new Date(String(failure.first_seen)).toLocaleString()}`,
+        `Last seen: ${new Date(String(failure.last_seen)).toLocaleString()}`,
+      ];
+      if (failure.last_commit_sha) lines.push(`Last failing commit: ${failure.last_commit_sha}`);
+      if (failure.last_build_id) lines.push(`Last failing build: ${failure.last_build_id}`);
+      if (task) {
+        lines.push(`Paired task: "${task.title}" [${task.status}, ${task.priority}] — ${task.id}`);
+      } else if (failure.open_brain_task_id) {
+        lines.push(`Paired task: ${failure.open_brain_task_id} (not found — may have been deleted)`);
+      }
+      if (failure.last_error_excerpt) {
+        lines.push("", "--- Last error excerpt ---", String(failure.last_error_excerpt));
+      }
+      lines.push("", `ID: ${failure.id}`);
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  );
+
+  registerTool(
+    "resolve_ci_failure",
+    {
+      description: "Manually mark a ci_failures row resolved and close its paired Open Brain task. Normal usage has the ci-triage webhook resolve rows automatically on the next green build; use this tool only when the underlying test has been deleted or intentionally disabled, so the row will never get a green build to close it naturally.",
+      inputSchema: z.object({
+        ci_failure_id: z.string(),
+        reason: z.string().optional(),
+      }),
+    },
+    async ({ ci_failure_id, reason }) => {
+      const { data: existing, error: fetchErr } = await supabase.from("ci_failures")
+        .select("id, project, pipeline, test_name, fixture_id, resolved_at, open_brain_task_id")
+        .eq("id", ci_failure_id)
+        .maybeSingle();
+      if (fetchErr) throw new Error(fetchErr.message);
+      if (!existing) {
+        return { content: [{ type: "text", text: `No ci_failures row with ID "${ci_failure_id}".` }] };
+      }
+      if (existing.resolved_at) {
+        return { content: [{ type: "text", text: `Already resolved at ${existing.resolved_at}.` }] };
+      }
+
+      const now = new Date().toISOString();
+      const { error: updErr } = await supabase.from("ci_failures")
+        .update({ resolved_at: now, consecutive_failures: 0 })
+        .eq("id", ci_failure_id);
+      if (updErr) throw new Error(`ci_failures update: ${updErr.message}`);
+
+      let taskStatus = "no paired task";
+      if (existing.open_brain_task_id) {
+        const { error: taskErr } = await supabase.from("tasks")
+          .update({ status: "done" })
+          .eq("id", existing.open_brain_task_id);
+        taskStatus = taskErr
+          ? `paired task ${existing.open_brain_task_id} update failed: ${taskErr.message}`
+          : `paired task ${existing.open_brain_task_id} marked done`;
+      }
+
+      const reasonLine = reason ? `\nReason: ${reason}` : "";
+      return {
+        content: [{
+          type: "text",
+          text: `Resolved ${existing.project}/${existing.pipeline}: ${existing.test_name}${existing.fixture_id ? `/${existing.fixture_id}` : ""}.\n${taskStatus}.${reasonLine}`,
+        }],
+      };
+    },
+  );
+
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
