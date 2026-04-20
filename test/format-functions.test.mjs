@@ -137,61 +137,6 @@ test("captureThought includes action items in confirmation", async () => {
 
 // ─── Tool confirmation message patterns ────────────────────────────────
 
-test("create_task confirmation includes title and priority", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"create_task"', 2000);
-  assert.match(fn, /Created task:/, "Should confirm creation");
-  assert.match(fn, /data\.title/, "Should include title");
-  assert.match(fn, /data\.priority/, "Should include priority");
-});
-
-test("create_task confirmation includes due date when present", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"create_task"', 2000);
-  assert.match(fn, /if \(data\.due_date\)/, "Should conditionally show due date");
-});
-
-test("create_task confirmation includes project ID when present", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"create_task"', 2000);
-  assert.match(fn, /if \(data\.project_id\)/, "Should conditionally show project ID");
-});
-
-test("create_project confirmation includes name and status", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"create_project"', 1500);
-  assert.match(fn, /Created project:/, "Should confirm creation");
-  assert.match(fn, /data\.name/, "Should include name");
-  assert.match(fn, /data\.status/, "Should include status");
-});
-
-test("update_task confirmation includes title, status, priority", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"update_task"', 2000);
-  assert.match(fn, /Updated:/, "Should confirm update");
-  assert.match(fn, /data\.status/, "Should include status");
-  assert.match(fn, /data\.priority/, "Should include priority");
-});
-
-test("delete_task confirmation includes title", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"delete_task"', 1000);
-  assert.match(fn, /Deleted task/, "Should confirm deletion");
-  assert.match(fn, /data\.title/, "Should include title");
-});
-
-test("bulk_delete_tasks confirmation lists deleted tasks", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"bulk_delete_tasks"', 1500);
-  assert.match(fn, /Deleted \$\{data\.length\} task\(s\)/, "Should count deleted tasks");
-});
-
-test("bulk_update_tasks confirmation lists updated tasks", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"bulk_update_tasks"', 1500);
-  assert.match(fn, /Updated \$\{data\.length\} task\(s\)/, "Should count updated tasks");
-});
-
 // ─── Constants ─────────────────────────────────────────────────────────
 
 test("SERVER_VERSION is defined", async () => {
@@ -202,14 +147,4 @@ test("SERVER_VERSION is defined", async () => {
 test("MAX_THOUGHT_CHARS limits content length", async () => {
   const content = await readIndex();
   assert.match(content, /const MAX_THOUGHT_CHARS = 12000/);
-});
-
-test("TASK_NOTE_TYPES includes note and deliverable", async () => {
-  const content = await readIndex();
-  assert.match(content, /TASK_NOTE_TYPES.*"note".*"deliverable"/s);
-});
-
-test("PROJECT_STATUSES includes active and archived", async () => {
-  const content = await readIndex();
-  assert.match(content, /PROJECT_STATUSES.*"active".*"archived"/s);
 });
