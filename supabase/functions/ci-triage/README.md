@@ -2,18 +2,16 @@
 
 Supabase Edge Function that ingests CI failure reports from any CI
 system (today: Cloud Build via `redline/infra/ci/cloudbuild-triage-integration.yaml`)
-and maintains:
+and opens/updates/closes GitHub issues on the target repo to match reality:
 
-- `public.ci_failures` — deduplicated failure rows keyed on
-  `(project, pipeline, test_name, fixture_id)`.
-- `public.tasks` — one Open Brain task per distinct regression,
-  auto-created on the first failure and auto-closed on the first
-  subsequent success.
-
-The function is intentionally project-agnostic: callers identify
-themselves via the `project` field of the payload (case-insensitive
-match against `projects.name`). Any repo with its own Open Brain
-project can send failures here without modifying this function.
+- **First failure for a (pipeline, test, fixture)** → opens a new issue
+  on the target repo with label `ci-failure` and a body containing the
+  failing commit, build log, reproduce command, and error excerpt.
+- **Subsequent failures of the same (pipeline, test, fixture)** → posts
+  a comment with the latest excerpt.
+- **Subsequent green build of the pipeline** → closes every open
+  `ci-failure` issue for that pipeline that isn't in the current failure
+  set (with a resolution comment).
 
 ## Deployed at
 
@@ -22,11 +20,6 @@ project can send failures here without modifying this function.
 
 ## Deploy
 
-This is the canonical source (redline carries a mirror under
-`infra/supabase/functions/ci-triage/` for audit history; that mirror
-tracks this one, not the other way around). When updating, redeploy
-via the Supabase CLI:
-
 ```bash
 supabase functions deploy ci-triage \
   --project-ref dqjrajbxhnbstbloqxbl \
@@ -34,34 +27,32 @@ supabase functions deploy ci-triage \
 ```
 
 `--no-verify-jwt` is required — the function does its own Bearer token
-check against a Postgres-stored secret. Do not flip that on.
+check against `CI_TRIAGE_WEBHOOK_SECRET`. Do not flip that on.
 
-## Bearer token storage
+## Required Edge Function secrets
 
-The function reads the expected Bearer token from
-`public.webhook_secrets` where `name = 'ci_triage_webhook_key'`. Storing
-the token in Postgres (RLS on, no policies — only the service role can
-read it) means the token can be seeded and rotated entirely via SQL:
+| secret | purpose |
+|---|---|
+| `CI_TRIAGE_WEBHOOK_SECRET` | Shared Bearer token Cloud Build sends in `Authorization` |
+| `CI_TRIAGE_GITHUB_TOKEN`   | Fine-grained GitHub PAT with `Issues: Read and write` on the target repo |
+| `CI_TRIAGE_GITHUB_REPO`    | `owner/repo` for the target repo (e.g. `atorenherrinton/redline`) |
 
-```sql
-update public.webhook_secrets
-   set value = '<new-token>', updated_at = now()
- where name = 'ci_triage_webhook_key';
+Rotate via:
+
+```bash
+supabase secrets set CI_TRIAGE_GITHUB_TOKEN=<new> --project-ref dqjrajbxhnbstbloqxbl
 ```
 
-Callers keep their copy of the same token in their own secret store
-(redline stores it in GCP Secret Manager as `rl-ci-triage-webhook-key`
-and sends it via Cloud Build `availableSecrets`). Both sides must match
-or the webhook returns 401.
-
-`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are auto-injected by
-Supabase — no additional env vars to configure.
+When rotating `CI_TRIAGE_WEBHOOK_SECRET`, the caller's copy must be
+updated too (redline stores it in GCP Secret Manager as
+`rl-ci-triage-webhook-key` and sends it via Cloud Build
+`availableSecrets`).
 
 ## Payload
 
 ```json
 {
-  "project":       "redline",              // required; must match projects.name case-insensitive
+  "project":       "redline",              // optional, kept for back-compat
   "pipeline":      "triage-integration",   // required
   "build_id":      "abc-123",              // optional
   "commit_sha":    "1234deadbeef",         // optional
@@ -76,8 +67,3 @@ Supabase — no additional env vars to configure.
   ]
 }
 ```
-
-## Schema reference
-
-- `public.ci_failures` — migration `202604170001_ci_failures.sql`.
-- `public.webhook_secrets` — migration `202604170002_webhook_secrets.sql`.

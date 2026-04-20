@@ -139,27 +139,6 @@ test("all tool handlers use normalizeToolResult or normalizeToolError", async ()
   assert.match(wrapper, /normalizeToolError/, "registerTool wrapper should normalize errors");
 });
 
-test("update_task only updates provided fields", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"update_task"', 2000);
-  // Should build update object conditionally using !== undefined checks
-  assert.match(fn, /title !== undefined/, "Should conditionally include title");
-  assert.match(fn, /description !== undefined/, "Should conditionally include description");
-  assert.match(fn, /status !== undefined/, "Should conditionally include status");
-});
-
-test("delete_task requires confirmation via task_id", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"delete_task"', 1500);
-  assert.match(fn, /task_id.*z\.string\(\)/, "Should require task_id as string");
-});
-
-test("bulk_delete_tasks requires array of task_ids", async () => {
-  const content = await readIndex();
-  const fn = sliceFrom(content, '"bulk_delete_tasks"', 1500);
-  assert.match(fn, /task_ids.*z\.array/, "Should require task_ids as array");
-});
-
 test("search_thoughts uses vector similarity via searchThoughts helper", async () => {
   const content = await readIndex();
   // The tool handler calls searchThoughts(), which internally uses getEmbedding + match_thoughts
@@ -170,14 +149,4 @@ test("search_thoughts uses vector similarity via searchThoughts helper", async (
   const helper = sliceFrom(content, "async function searchThoughts(", 1000);
   assert.match(helper, /getEmbedding/, "searchThoughts should embed query");
   assert.match(helper, /match_thoughts/, "searchThoughts should call match_thoughts RPC");
-});
-
-test("task statuses include archived", async () => {
-  const content = await readIndex();
-  assert.match(content, /TASK_STATUSES.*archived/s, "TASK_STATUSES should include archived");
-});
-
-test("task priorities include low, medium, high", async () => {
-  const content = await readIndex();
-  assert.match(content, /TASK_PRIORITIES.*low.*medium.*high/s, "Should define all priority levels");
 });
